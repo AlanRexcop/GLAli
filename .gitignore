@@ -131,4 +131,3 @@ dmypy.json
 # Custom
 output/
 debug.sh
-data/
