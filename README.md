@@ -21,7 +21,9 @@ The author adopt these codes to create this repository.
 * [LoCoOp: Few-Shot Out-of-Distribution Detection via Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/file/f0606b882692637835e8ac981089eccd-Paper-Conference.pdf), in NeurIPS, 2023
 
 ## About this fork repo:
-It seem the method is replicable after a few change to the codes and adding dataset.
+It seem the method is replicable for accuracy test after a few change to the codes and adding dataset.
+
+However, the authors did not include the code to load the 158 classes of SD-198 for OOD testing in this repository. They lazily copy-pasted the evaluation logic they used for the ISIC dataset (which the paper states did use DermNet as OOD) and applied it to Skin40 in the GitHub release.
 
 here is how to set it up in kaggle:
 ```
@@ -44,11 +46,6 @@ Training:
 ```
 # 5. Run the training!
 !CUDA_VISIBLE_DEVICES=0 bash scripts/GLAli/train.sh
-```
-Evaluation:
-```
-# 6. Run eval
-!CUDA_VISIBLE_DEVICES=0 bash scripts/GLAli/eval.sh
 ```
 
 addons:

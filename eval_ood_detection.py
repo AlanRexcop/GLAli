@@ -142,8 +142,7 @@ def main(args):
 
 
     if args.in_dataset in ['skin40', 'ISIC', 'Dermnet']:
-        # out_datasets = [item for item in ['skin40', 'ISIC', 'Dermnet'] if item != args.in_dataset]
-        out_datasets = ['skin40']
+        out_datasets = [item for item in ['skin40', 'ISIC', 'Dermnet'] if item != args.in_dataset]
         id_data_loader = trainer.dm.id_loader
 
     trainer.test()
