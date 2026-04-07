@@ -1,8 +1,10 @@
-Fewshot learning cho bài toán phân lớp. Đưa vào 1 ảnh và nhận về 1 nhãn
+# Phân lớp ảnh với dữ liệu học hạn chế
 
-Dữ liệu là:
-- Ảnh 
-- Nhãn
+- Huỳnh Tuấn Phong - 23127100
+- Nguyễn Trọng Nhân - 23127095
+
+Fewshot learning cho bài toán phân lớp: 
+- Đưa vào 1 ảnh và nhận về 1 nhãn.
 
 Vì bài toán fewshot learning là bài toán ill posed:
 $$P(\theta \mid \mathcal{D}) \propto \underbrace{P(\mathcal{D} \mid \theta)}_{\text{yếu}} \cdot \underbrace{P(\theta)}_{\text{mình kiểm soát}}$$
@@ -14,16 +16,33 @@ Foundation model là:
 Tận dụng prior knowledge là: 
 - Text prompt mô tả hình dạng từng loại bệnh.
 
-Khoảng trống nghiên cứu mà tác giả muốn cải thiện:
-- **Các Prompt văn bản Yếu và Mơ hồ:** CLIP tiêu chuẩn dựa vào các mẫu cơ bản như "một bức ảnh của [TÊN LỚP]". Đối với một căn bệnh như Actinic Keratosis, chỉ riêng cái tên không cho mô hình biết cần tìm kiếm những đặc điểm hình ảnh nào.
-- **Khoảng cách phương thức:** CLIP có kiến trúc nghiêm ngặt. Bộ mã hóa hình ảnh và bộ mã hóa văn bản không bao giờ "trò chuyện" với nhau cho đến tận bước cuối cùng, nơi các vector của chúng đơn giản là được nhân với nhau (tích vô hướng). Chúng không chia sẻ ngữ cảnh.
-- **Không tập trung vào các vùng cục bộ:** CLIP tiêu chuẩn mã hóa toàn bộ hình ảnh thành một vector toàn cục duy nhất. Điều này ổn khi nhận diện một con mèo, nhưng lại rất tệ đối với hình ảnh y tế, nơi mà bệnh lý (tổn thương) có thể chỉ chiếm 5% bức ảnh, trong khi 95% còn lại là da khỏe mạnh hoặc vùng nền. 
-- **Nhiễu từ vùng nền làm hỏng khả năng phát hiện OOD:** CLIP tiêu chuẩn dễ bị nhầm lẫn bởi vùng nền. Nếu một bệnh ngoài da mới, chưa từng biết đến xuất hiện trên một cánh tay người bình thường, CLIP tiêu chuẩn có thể sẽ nói "Tôi nhận ra cánh tay này!" và phân loại sai nó thành một căn bệnh đã biết
+Lúc train input:
+- Ảnh 
+- Nhãn
+- Text prompt (từ sách, bác sĩ, internet,...)
+
+Quá trình học là supervised learning
+
+Lúc suy luận input:
+- Ảnh
+
+Mô hình CLIP:
+![alt text](image-5.png)
 
 
-### 🛠️ Giai đoạn 1: Huấn luyện Từng bước (Training)
+Bốn khoảng trống nghiên cứu mà tác giả muốn cải thiện:
+1) **Các Prompt văn bản Yếu và Mơ hồ:** CLIP tiêu chuẩn dựa vào các mẫu cơ bản như "một bức ảnh của [TÊN LỚP]". Đối với một căn bệnh như Actinic Keratosis, chỉ riêng cái tên không cho mô hình biết cần tìm kiếm những đặc điểm hình ảnh nào.
+   - các bài nghiên cứu liên quan: Coop, CoCoOp, ProDA, PLOT, ...
+2) **Khoảng cách phương thức:** CLIP có kiến trúc nghiêm ngặt. Bộ mã hóa hình ảnh và bộ mã hóa văn bản không bao giờ "trò chuyện" với nhau cho đến tận bước cuối cùng, nơi các vector của chúng đơn giản là được nhân với nhau (tích vô hướng). Chúng không chia sẻ ngữ cảnh.
+   - các bài nghiên cứu liên quan: ALIGN, BLIP, ...
+3) **Không tập trung vào các vùng cục bộ:** CLIP tiêu chuẩn mã hóa toàn bộ hình ảnh thành một vector toàn cục duy nhất. Điều này ổn khi nhận diện một con mèo, nhưng lại rất tệ đối với hình ảnh y tế, nơi mà bệnh lý (tổn thương) có thể chỉ chiếm 5% bức ảnh, trong khi 95% còn lại là da khỏe mạnh hoặc vùng nền. 
+   - các bài nghiên cứu liên quan: LoCoop, ... 
+4) **Nhiễu từ vùng nền làm hỏng khả năng phát hiện OOD:** CLIP tiêu chuẩn dễ bị nhầm lẫn bởi vùng nền. Nếu một bệnh ngoài da mới, chưa từng biết đến xuất hiện trên một cánh tay người bình thường, CLIP tiêu chuẩn có thể sẽ nói "Tôi nhận ra cánh tay này!" và phân loại sai nó thành một căn bệnh đã biết
+   -  các bài nghiên cứu liên quan: NegPrompt, ...
 
-**Bước 1: Khởi tạo Nguyên mẫu Văn bản bằng LLM**
+#### Giai đoạn huấn luyện:
+
+**Bước 1: Khởi tạo Nguyên mẫu văn bản bằng LLM**
 ![alt text](image.png)
 *   **Những gì tác giả thực hiện:** Trước khi quá trình huấn luyện bắt đầu. Với mỗi lớp bệnh $c$, họ lấy prompt tiêu chuẩn ("một bức ảnh của [Lớp]") (gọi là $t_{c,0}$) và nối thêm $M$ câu văn do LLM tạo ra (từ $t_{c,1}$ đến $t_{c,M}$) mô tả chi tiết kết cấu, màu sắc và hình dạng của bệnh. Họ đưa toàn bộ tập hợp này qua Bộ mã hóa Văn bản CLIP bị đóng băng để tạo ra một tập hợp các vector (embeddings) $T_c$. Sau đó, họ tính trung bình cộng để tạo ra một vector chủ đạo $\bar{t}_c$:
   $$\bar{t}_c = \frac{1}{M+1}\sum_{j=0}^M t_{c,j}$$
@@ -32,11 +51,11 @@ Khoảng trống nghiên cứu mà tác giả muốn cải thiện:
 
 **Bước 2: Mạng Cross-Attention (Tinh chỉnh văn bản bằng hình ảnh)**
 ![alt text](image-1.png)
-*   **Những gì tác giả thực hiện:** Một batch hình ảnh được tải lên. Image encoder xuất ra vector toàn cục $z_0$ và các vector cục bộ (các patch ảnh) $z_i$. Mã tính toán độ tương đồng (cosine similarity) giữa các patch ảnh này và vector chủ đạo $\bar{t}_c$ ở Bước 1. Nó sử dụng thuật toán Top-K để phân loại:
+*   **Những gì tác giả thực hiện:** Một batch hình ảnh được tải lên. Image encoder xuất ra vector toàn cục $z_0$ và các vector cục bộ (các patch ảnh) $z_i$. Họ tính toán độ tương đồng (cosine similarity) giữa các patch ảnh này và vector chủ đạo $\bar{t}_c$ ở Bước 1. Nó sử dụng thuật toán Top-K để phân loại:
     * **Top-k patch** khớp cao nhất được tách ra làm Tổn thương (ID).
     * **Bottom-k patch** khớp thấp nhất được tách ra làm Vùng nền/da khỏe mạnh (OOD).
 
-  Mã lấy các Top-k patch tổn thương và đưa vào mạng Cross-Attention cùng với các embedding văn bản. Tại đây, hình ảnh giúp cập nhật (refine) văn bản. Kết quả đầu ra là một vector văn bản mới $t'_{c,j}$. Tác giả kết hợp vector mới này với vector gốc bằng công thức nội suy:
+  Họ lấy các Top-k patch tổn thương và đưa vào mạng Cross-Attention cùng với các embedding văn bản. Tại đây, hình ảnh giúp cập nhật (refine) văn bản. Kết quả đầu ra là một vector văn bản mới $t'_{c,j}$. Tác giả kết hợp vector mới này với vector gốc bằng công thức nội suy:
   $$\hat{t}_{c,j} = \alpha t_{c,j} + (1-\alpha)t'_{c,j}$$
   * **Giải thích toán học:** * $t_{c,j}$ là văn bản gốc (nguyên thủy).
     * $t'_{c,j}$ là văn bản *sau khi đã nhìn thấy* hình ảnh tổn thương.
@@ -59,7 +78,7 @@ Khoảng trống nghiên cứu mà tác giả muốn cải thiện:
   Cuối cùng, Logit $u_c$ được đưa vào hàm mất mát Cross-Entropy ($\mathcal{L}_{CE}$) để huấn luyện:
   $$\mathcal{L}_{CE} = -\log \frac{\exp(u_y / \tau)}{\sum_{c=1}^C \exp(u_c / \tau)}$$
   *(Với $y$ là nhãn thực của ảnh và $\tau$ là nhiệt độ).*
-  * **Ý đồ Tối ưu hóa:** Hàm Loss đóng vai trò là "áp lực tiến hóa". Để hàm Loss giảm, $u_y$ (điểm của lớp đúng) bắt buộc phải vượt trội. Điều này ép toàn bộ mạng lưới (từ mạng Cross-Attention đến các trọng số $\beta, \gamma$) phải tự nắn chỉnh để nhận diện chính xác các đặc trưng nhỏ nhất.
+  * **Ý đồ Tối ưu hóa:** Để hàm Loss giảm, $u_y$ (điểm của lớp đúng) bắt buộc phải vượt trội. Điều này ép toàn bộ mạng lưới (từ mạng Cross-Attention đến các trọng số $\beta, \gamma$) phải tự nắn chỉnh để nhận diện chính xác các đặc trưng nhỏ nhất.
 
 *   **✅ Giải quyết Vấn đề 3 (Mù quáng cục bộ):** Dự đoán cuối cùng không chỉ dựa trên toàn bộ hình ảnh; nó được đánh trọng số về mặt toán học bởi mức độ khớp của các patch cục bộ (tổn thương) so với các mô tả văn bản chi tiết.
 
@@ -71,15 +90,25 @@ Khoảng trống nghiên cứu mà tác giả muốn cải thiện:
   3. Tính toán hàm Loss tương phản (SupCon Loss):
   $$\mathcal{L}_{SC} = -\frac{1}{S} \sum_{s=1}^S \frac{1}{|P(s)|} \sum_{p \in P(s)} \log \frac{\exp(g(z_s, z_p)/\tau)}{\sum_{a=1}^S \exp(g(z_s, z_a)/\tau)}$$
   * **Giải thích toán học & Ý đồ tác giả:** Nhìn vào phân số bên trong dấu Log.
-    * **Tử số:** $\exp(g(z_s, z_p))$. Đây là khoảng cách giữa 2 patch có **CÙNG** nhãn (ví dụ: patch tổn thương A và patch tổn thương B). Để hàm Loss giảm, thuật toán bắt buộc phải làm tử số này to lên $\rightarrow$ **Kéo các patch bệnh lý lại gần nhau.**
-    * **Mẫu số:** $\sum \exp(g(z_s, z_a))$. Đây là khoảng cách giữa patch hiện tại với **TẤT CẢ** các patch khác, bao gồm cả các patch "Vùng nền nhãn giả". Để hàm Loss giảm, thuật toán phải làm mẫu số nhỏ đi $\rightarrow$ **Đẩy các patch vùng nền văng ra thật xa khỏi các patch bệnh lý.**
+    * **Tử số:** $\exp(g(z_s, z_p))$. Đây là khoảng cách giữa 2 patch có **CÙNG** nhãn (ví dụ: patch tổn thương A và patch tổn thương B). Để hàm Loss giảm, thuật toán bắt buộc phải làm tử số này nhỏ đi  $\rightarrow$ **Kéo các patch bệnh lý lại gần nhau.**
+    * **Mẫu số:** $\sum \exp(g(z_s, z_a))$. Đây là khoảng cách giữa patch hiện tại với **TẤT CẢ** các patch khác, bao gồm cả các patch "Vùng nền nhãn giả". Để hàm Loss giảm, thuật toán phải làm mẫu số to lên $\rightarrow$ **Đẩy các patch vùng nền văng ra thật xa khỏi các patch bệnh lý.**
 *   **✅ Giải quyết Vấn đề 4 (Can nhiễu vùng nền):**  Buộc mô hình đẩy các các patch nền ra thật xa khỏi các embedding văn bản của bệnh trong không gian tiềm ẩn, dạy cho mô hình cách chủ động phớt lờ vùng nền.
+
+**Kết luận:** hàm loss cuối cùng của bài là:
+$$\mathcal{L} = \mathcal{L}_{CE} + \lambda_1 \mathcal{L}_{SC} + \lambda_2 \mathcal{L}_{I} + \lambda_3 \mathcal{L}_{T}$$
+với:
+- $\lambda_1, \lambda_2, \lambda_3$ là các hằng số
+- $\mathcal{L}_{CE}$ hàm loss cross-entropy khi mô hình dự đoán đúng nhãn hàm sẽ có giá trị thấp. Giúp mô hình đoán đúng nhãn.
+- $\mathcal{L}_{SC}$ hàm loss tương phản khi các patch ảnh cùng nhãn gần nhau và khác nhãn xa nhau thì hàm sẽ có giá trị thấp. Giúp mô hình tạo không gian ẩn có khả năng phát hiện OOD.
+- $\mathcal{L}_{I}, \mathcal{L}_{T}$ 2 hàm này thấp khi các embedding vẫn còn gần các embedding gốc. Giúp mô hình không đi quá xa so với CLIP gốc vì mình đóng băng hầu hết các decoder.
 
 ---
 
-### 🔍 Giai đoạn 2: Suy luận & Phát hiện OOD Từng bước (Inference)
+### Giai đoạn suy luận & Phát hiện OOD
 
 Trong quá trình suy luận, mô hình bị đóng băng hoàn toàn. Nó phải nhìn vào một hình ảnh mới và tính toán một "Điểm số OOD" để xác định xem hình ảnh đó là một căn bệnh đã biết hay là một điểm dị thường.
+
+![alt text](image-4.png)
 
 **Bước 0: Tiền xử lý (Image Preprocessing):**
 * **Thao tác:** Ảnh y tế đầu vào được resize về kích thước chuẩn của CLIP (thường là $224 \times 224$ pixels).
