@@ -27,7 +27,7 @@ do
         #     echo "Oops! The results exist at ${DIR} (so skip this job)"
         # else
         echo $PWD
-        CUDA_VISIBLE_DEVICES=0,1 python train.py \
+        CUDA_VISIBLE_DEVICES=0 python train.py \
         --root ${DATA} \
         --seed ${SEED} \
         --trainer ${TRAINER} \
