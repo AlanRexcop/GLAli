@@ -1,6 +1,7 @@
 #!/bin/bash
 # custom config
 TRAINER=LocProto
+TRAINER=LocProtoBiomed
 
 # DATA=$1
 DATA=./datasets/

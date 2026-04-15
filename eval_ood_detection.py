@@ -9,6 +9,7 @@ from utils.detection_util import get_and_print_results
 import trainers.locoop
 import trainers.zsclip_contra
 import trainers.locproto_supc
+import trainers.locproto_supc_biomed
 import datasets.skin40
 import datasets.ISIC
 import datasets.Dermnet

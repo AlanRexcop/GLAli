@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # custom config
-TRAINER=LocProto
+# TRAINER=LocProto
+TRAINER=LocProtoBiomed
 
 CSC=False
 CTP=end

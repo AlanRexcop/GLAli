@@ -6,6 +6,7 @@ from dassl.config import get_cfg_default
 from dassl.engine import build_trainer
 import trainers.locoop
 import trainers.locproto_supc
+import trainers.locproto_supc_biomed
 import datasets.skin40
 import datasets.ISIC
 import datasets.Dermnet

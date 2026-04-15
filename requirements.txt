@@ -6,3 +6,5 @@ medmnist
 timm
 faiss-cpu
 scikit-learn
+open_clip_torch
+transformers
