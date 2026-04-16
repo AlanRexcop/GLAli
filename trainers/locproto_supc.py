@@ -63,7 +63,6 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    
     logits = base_logits + bias_logits
     return logits
 
@@ -152,16 +151,15 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        
         self.tip_adapter = None
         if cache_keys is not None:
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
             
-            # change to one scaler
-            self.fusion_gate = nn.Parameter(torch.tensor(0.0, dtype=self.dtype)) # One scalar for all
+            # Learnable scalar fusion gate
+            self.fusion_gate = nn.Parameter(torch.tensor(0.0, dtype=self.dtype))
 
             self.tip_alpha = 1.0  
-            self.tip_beta = 5.5   
+            self.tip_beta = 5.5   # Stays as a fixed float
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
@@ -238,14 +236,14 @@ class CustomCLIP(nn.Module):
         if self.tip_adapter is not None:
             # 2. Tip-Adapter Logic (Visual Cache)
             affinity = self.tip_adapter(image_features)
-            safe_beta = F.softplus(self.tip_beta)
-            logits_cache_raw = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values
+            
+            # Statically using tip_beta = 5.5 without F.softplus
+            logits_cache_raw = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
             
             # 3. [LOGIT STANDARDIZATION]
             # This is the "Fair Choice" mechanism. It scales both experts to unit variance 
             # across the class dimension so the gate can blend them effectively.
             def standardize(x):
-                # We subtract mean and divide by std along the class dimension
                 return (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True) + 1e-8)
 
             glali_std = standardize(logits_glali_raw)
@@ -253,7 +251,6 @@ class CustomCLIP(nn.Module):
             cache_std = standardize(logits_cache_raw)
 
             # 4. Gated Fusion (Inter-Method)
-            # fusion_gate is now a scalar nn.Parameter(torch.tensor(0.0))
             f_gate = torch.sigmoid(self.fusion_gate)
             
             # Weighted average of standardized signals
@@ -327,12 +324,12 @@ class LocProto(TrainerX):
         print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys + Gates")
+        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys + Fusion Gate")
         for name, param in self.model.named_parameters():
-            # [NEW: GATED FUSION] - Added fusion_gate to trainable parameters
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
-                'fusion_gate' in name):
+                'tip_adapter' in name or 
+                'fusion_gate' in name): # Only fusion_gate retained as trainable here
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -351,15 +348,16 @@ class LocProto(TrainerX):
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # ---------------- [NEW: GATED FUSION] OPTIMIZER ----------------
+            # ---------------- MODIFIED TIP-ADAPTER OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.0001
+                cfg.OPTIM_TIP.LR = 0.001
                 
-                # Bundle all the new gating parameters
-                tip_params =[
-                    self.model.tip_adapter.weight,
-                    self.model.fusion_gate
+                # Use parameter-specific learning rates to avoid overfitting
+                # Tip-adapter keys keep 0.001, but the Fusion gate uses 0.0001
+                tip_params = [
+                    {"params": [self.model.tip_adapter.weight], "lr": 0.001},
+                    {"params": [self.model.fusion_gate], "lr": 0.0001}
                 ]
                 
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
