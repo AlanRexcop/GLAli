@@ -224,17 +224,32 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
         logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
 
-        # ---------------- FIX 2: EXACT TIP-ADAPTER-F LOGIC ----------------
-        if self.tip_adapter is not None:
-            affinity = self.tip_adapter(image_features)
+        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
+        if getattr(self, "tip_adapter", None) is not None:
+            # Inference: We don't know the label, so find the most "pathological" patches overall
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) # [n_cls, d]
+            
+            # Sim of all patches to all diseases ->[bs, 196, n_cls]
+            sim_to_all = torch.matmul(local_image_features, text_tea.T)
+            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) # [bs, 196]
+            
+            # Select Top-K most "disease-like" patches
+            _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
+            
+            # Extract and average to form the Lesion Query
+            lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
+            lesion_query = lesion_patches.mean(dim=1)
+            lesion_query = F.normalize(lesion_query, p=2, dim=-1)
+            
+            # Match lesion query against the Lesion Cache
+            affinity = self.tip_adapter(lesion_query)
             cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
             
-            # REMOVED * logit_scale to prevent gradient explosion!
             scaled_cache_logits = cache_logits * self.tip_alpha
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
-        # ------------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -259,8 +274,12 @@ class LocProto(TrainerX):
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        # ---------------- CONSTRUCT EXACT TIP-ADAPTER CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache from training set (Tip-Adapter)...")
+        print("Building custom CLIP")
+        self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=None, cache_values=None)
+        self.model.to(self.device)
+
+        # ---------------- CONSTRUCT LESION-ONLY TIP-ADAPTER CACHE ----------------
+        print("Extracting Pristine Visual Memory Cache (Lesion-Only) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
             cfg,
@@ -270,40 +289,51 @@ class LocProto(TrainerX):
             tfm=tfm_test,
             is_train=False
         )
-        # print("Extracting Augmented Visual Memory Cache from training set (Tip-Adapter)...")
-        # tfm_train = build_transform(cfg, is_train=True)
-        # cache_loader = build_data_loader(
-        #     cfg,
-        #     sampler_type="SequentialSampler", # Keep sequential so we process all images exactly once
-        #     data_source=self.dm.dataset.train_x,
-        #     batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE, # Use train batch size
-        #     tfm=tfm_train,
-        #     is_train=True # Revert to True to apply random crops/flips
-        # )
 
-        clip_model.to(self.device)
-        clip_model.eval()
+        self.model.eval()
         
         cache_keys = []
         cache_labels =[]
         
         with torch.no_grad():
+            text_tea = self.model.text_features_tea.to(self.device)
+            
             for batch in tqdm(cache_loader, desc="Building Cache"):
                 image = batch["img"].to(self.device)
                 label = batch["label"].to(self.device)
                 
-                img_feat, _, _ = clip_model.visual(image.type(clip_model.dtype))
-                img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                # Extract local features via the frozen visual encoder
+                _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
+                local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
-                cache_keys.append(img_feat.cpu())
+                # Use ground truth label to find EXACT lesion patches
+                gt_text = text_tea[label].unsqueeze(1) # [bs, 1, d]
+                sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1) #[bs, 196]
+                
+                # Get Top-K lesion patches
+                _, idx_pos = torch.topk(sim_to_gt, k=self.top_k, dim=1)
+                
+                d_dim = local_feat.shape[-1]
+                lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
+                
+                # Average lesion patches for cache representation
+                lesion_feat_mean = lesion_feats.mean(dim=1)
+                lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
+                
+                cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
         cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
-        print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=cache_keys, cache_values=cache_values)
+        print("Injecting Lesion-Only Cache into Tip-Adapter...")
+        self.model.tip_alpha = 1.0  
+        self.model.tip_beta = 5.5   
+        self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
+        self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
+        self.model.register_buffer("cache_values", cache_values)
+        # -------------------------------------------------------------------------
 
         print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
         for name, param in self.model.named_parameters():
