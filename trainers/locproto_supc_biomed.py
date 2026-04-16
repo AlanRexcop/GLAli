@@ -13,7 +13,7 @@ from copy import deepcopy
 from dassl.engine import TRAINER_REGISTRY
 from utils.trainer import TrainerX
 from dassl.metrics import compute_accuracy
-from dassl.utils import load_pretrained_weights, load_checkpoint
+from dassl.utils import load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 from dassl.data.transforms import build_transform
 
@@ -62,14 +62,12 @@ def get_supc_loss(g_img_feats, id_loc_feats, ood_loc_feats, text_stu, text_tea, 
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
-        # BiomedCLIP text model is a HuggingFace BertModel
         self.text_model = clip_model.text.transformer
-        self.pooler = clip_model.text.pooler
         self.proj = clip_model.text.proj
 
     def forward(self, inputs_embeds, attention_mask):
         outputs = self.text_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-        pooled_out = self.pooler(outputs)
+        pooled_out = outputs.last_hidden_state[:, 0, :]
         if self.proj is not None:
             pooled_out = pooled_out @ self.proj
         return pooled_out
@@ -81,7 +79,6 @@ class PromptLearner(nn.Module):
         n_ctx = cfg.TRAINER.LOCOOP.N_CTX
         ctx_init = cfg.TRAINER.LOCOOP.CTX_INIT
         
-        # In OpenCLIP HF models, embeddings are at `embeddings.word_embeddings`
         word_embedding = clip_model.text.transformer.embeddings.word_embeddings
         ctx_dim = word_embedding.weight.shape[1]
         
@@ -92,16 +89,14 @@ class PromptLearner(nn.Module):
             with torch.no_grad():
                 embedding = word_embedding(prompt_ids.cuda())
             ctx_vectors = embedding
-            prompt_prefix = ctx_init
         else:
             ctx_vectors = torch.empty(n_ctx, ctx_dim)
             nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
 
         self.ctx = nn.Parameter(ctx_vectors)
         classnames = [name.replace("_", " ") for name in classnames]
         
-        max_len = 77
+        max_len = 256
         self.token_prefix = []
         self.token_suffix = []
         self.attention_mask = []
@@ -152,11 +147,11 @@ class CustomCLIP(nn.Module):
         self.cfg = cfg
 
         description_file = os.path.join('./description', f'{cfg.DATASET.NAME}.json')
-        print(f'Using description file: {description_file}')
         llm_descriptions = json.load(open(description_file))
         text_features =[]
         template = CUSTOM_TEMPLATES[cfg.DATASET.NAME]
-        all_prompt =[]
+        
+        oc_tokenizer = open_clip.get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
         
         for classname in classnames:
             prompts = []
@@ -167,14 +162,11 @@ class CustomCLIP(nn.Module):
                 prompt_desc = prompt + ' ' + llm_descriptions[classname.replace("_", " ")][i]
                 prompts.append(prompt_desc)
                 
-            prompts_tokens = open_clip.tokenize(prompts, context_length=256).cuda()
-            all_prompt.append(prompts_tokens)
+            prompts_tokens = oc_tokenizer(prompts, context_length=256).cuda()
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     text_features.append(clip_model.encode_text(prompts_tokens)) 
-                    
-        self.all_prompt = torch.cat(all_prompt)
 
         text_features = torch.cat(text_features) 
         _, d = text_features.shape
@@ -324,20 +316,21 @@ class LocProtoBiomed(TrainerX):
         print("Building custom BiomedCLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, tokenizer, cache_keys=cache_keys, cache_values=cache_values)
 
+        # ---------------- FIXED: Optimize timm blocks instead of OpenAI resblocks ----------------
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name or 'prompt_learner' in name:
+            if 'image_encoder.trunk.blocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name or 'prompt_learner' in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
 
         self.model.to(self.device)
         
-        # Register Optimizers
-        self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
+        # Register Optimizers using TimmModel structure
+        self.optim = build_optimizer(self.model.image_encoder.trunk.blocks[-1].attn, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
+        self.register_model("attn_learner", self.model.image_encoder.trunk.blocks[-1].attn, self.optim, self.sched)
+        # -----------------------------------------------------------------------------------------
         
-        # Optimize prompt vectors
         cfg.OPTIM_PROMPT = deepcopy(cfg.OPTIM)
         self.optim_prompt = build_optimizer(self.model.prompt_learner, cfg.OPTIM_PROMPT)
         self.sched_prompt = build_lr_scheduler(self.optim_prompt, cfg.OPTIM_PROMPT)
@@ -372,11 +365,9 @@ class LocProtoBiomed(TrainerX):
                 loss_id2 = F.cross_entropy(output_local, label)
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 
-                # Check dimensional shapes just in case text_stu is pooled differently
                 if text_stu.shape == all_text_features_tea.shape:
                     loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 else:
-                    # Using the first token vector as representation if sizes mis-match
                     loss_distil_text = F.l1_loss(all_text_features_tea.mean(dim=0), text_stu.mean(dim=0), reduction='mean') * 25
                 
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5

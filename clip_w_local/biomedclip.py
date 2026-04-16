@@ -11,31 +11,23 @@ def load_biomedclip(device="cuda"):
     model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(model_name)
     tokenizer = AutoTokenizer.from_pretrained("microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
 
-    # Hook / Override the visual forward to return local features
+    # Hook / Override the visual forward to return local features for TimmModel
     def new_visual_forward(self, x, mask=None):
-        # OpenCLIP ViT forward
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        # 1. Forward through the timm trunk. For ViTs, this returns the unpooled sequence [B, 197, 768]
+        features = self.trunk.forward_features(x)
         
-        x = torch.cat(
-            [self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-             x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        # 2. Extract Global (CLS token) and Local (Patch tokens)
+        if hasattr(self, 'pool') and self.pool is not None:
+            global_feat = self.pool(features)
+        else:
+            global_feat = features[:, 0, :]
+            
+        local_feat = features[:, 1:, :]
         
-        x = self.ln_pre(x)
-        
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        
-        # Extract Global and Local features
-        global_feat = self.ln_post(x[:, 0, :])
-        local_feat = self.ln_post(x[:, 1:, :])
-        
-        if self.proj is not None:
-            global_feat = global_feat @ self.proj
-            local_feat = local_feat @ self.proj
+        # 3. Apply OpenCLIP's projection head (maps 768 -> 512 for BiomedCLIP)
+        if hasattr(self, 'head') and isinstance(self.head, torch.nn.Linear):
+            global_feat = self.head(global_feat)
+            local_feat = self.head(local_feat) # nn.Linear broadcasts across the sequence dimension automatically
             
         return global_feat, local_feat, None
 
