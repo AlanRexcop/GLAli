@@ -43,27 +43,28 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
-    base_logits = image_features @ mean_text_features.T   
-    image_features = image_features.unsqueeze(1)  
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
+    base_logits = image_features @ mean_text_features.T   #[bs, 512] *[N, 512] -> [bs, N]
+    image_features = image_features.unsqueeze(1)  #[bs, 1, 512]
     all_image_features = local_image_features
-    w = torch.einsum('bmd,bnd->bmn', image_features, all_image_features) 
+    w = torch.einsum('bmd,bnd->bmn', image_features, all_image_features) #[bs, 1, 197]
 
-    mean_text_features = mean_text_features.unsqueeze(0) 
+    mean_text_features = mean_text_features.unsqueeze(0) #[n_desc, N, 512]
     _,n_cls,d = mean_text_features.shape
     all_text_features = all_text_features.reshape(-1, n_cls, d)
-    v = torch.einsum('mcd,ncd->mnc', mean_text_features, all_text_features)  
+    v = torch.einsum('mcd,ncd->mnc', mean_text_features, all_text_features)  #[1, N, 512] *[n_desc, N, 512] ->[1, n_desc, N]
     v = F.softmax(v, dim=1)
-    sim = torch.einsum('bmd,ncd->bcmn', all_image_features, all_text_features)  
-    sim, idx = sim.topk(dim=2, k=topk)    
+    sim = torch.einsum('bmd,ncd->bcmn', all_image_features, all_text_features)  #[bs, 197, 512] *[n_desc, N, 512] ->[bs, N, 197, n_desc]
+    sim, idx = sim.topk(dim=2, k=topk)    #[bs, N, k, n_desc]
     idx = idx[:, 0, :, 0].unsqueeze(1)
     w = torch.gather(w, dim=2, index=idx)
     w = F.softmax(w, dim=-1)
-    weight = torch.einsum('bdm,dnc->bcmn', w,v) 
+    weight = torch.einsum('bdm,dnc->bcmn', w,v) #[bs, N, 197, n_desc]
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    logits = base_logits + bias_logits
+    # TWEAK 3: Apply global_weight
+    logits = (global_weight * base_logits) + bias_logits
     return logits
 
 
@@ -151,18 +152,23 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
+        # ---------------- TWEAK 3: LEARNABLE GLOBAL WEIGHT ----------------
+        self.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.dtype))
+
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Reverted to static floats (not nn.Parameter) to prevent explosion
-            self.tip_alpha = 1.0  
-            self.tip_beta = 5.5   
+            
+            # TWEAK 2: Class-specific alpha (vector of size num_classes)
+            self.tip_alpha = nn.Parameter(torch.ones(len(classnames), dtype=self.dtype))
+            
+            # TWEAK 3: Learnable Beta (starting at default 5.5)
+            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
-
     def forward(self, image, mask=None, labels = None):
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
@@ -221,15 +227,19 @@ class CustomCLIP(nn.Module):
 
         logit_scale = self.logit_scale.exp()
         
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        # Pass self.global_weight to the dense logits calculation
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=self.global_weight)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=self.global_weight)
 
         # ---------------- FIX 2: EXACT TIP-ADAPTER-F LOGIC ----------------
         if self.tip_adapter is not None:
             affinity = self.tip_adapter(image_features)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
             
-            # REMOVED * logit_scale to prevent gradient explosion!
+            # Ensure Beta doesn't go negative during backprop
+            safe_beta = F.softplus(self.tip_beta)
+            cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values
+            
+            # Apply class-specific alpha
             scaled_cache_logits = cache_logits * self.tip_alpha
             
             logits = logits + scaled_cache_logits
@@ -307,7 +317,12 @@ class LocProto(TrainerX):
 
         print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
+            if ('image_encoder.transformer.resblocks.11.attn' in name or 
+                'bonder' in name or 
+                'tip_adapter' in name or 
+                'tip_alpha' in name or 
+                'tip_beta' in name or 
+                'global_weight' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -330,8 +345,16 @@ class LocProto(TrainerX):
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
-                # ONLY the keys (adapter.weight) are optimized, NOT tip_alpha
-                self.optim_tip = build_optimizer(self.model.tip_adapter, cfg.OPTIM_TIP)
+                
+                # Bundle the keys, alpha, beta, and global_weight into one optimizer
+                tip_params =[
+                    self.model.tip_adapter.weight,
+                    self.model.tip_alpha,
+                    self.model.tip_beta,
+                    self.model.global_weight
+                ]
+                
+                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
             # ----------------------------------------------------------------------
