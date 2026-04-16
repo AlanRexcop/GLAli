@@ -43,8 +43,7 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-# [NEW: GATED FUSION] - Added glali_gate_val to balance global vs local
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, glali_gate_val=0.5):
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
     base_logits = image_features @ mean_text_features.T   #[bs, 512] *[N, 512] -> [bs, N]
     image_features = image_features.unsqueeze(1)  #[bs, 1, 512]
     all_image_features = local_image_features
@@ -65,8 +64,7 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
     
-    # [NEW: GATED FUSION] Safely blend Global and Local representations
-    logits = (glali_gate_val * base_logits) + ((1.0 - glali_gate_val) * bias_logits)
+    logits = base_logits + bias_logits
     return logits
 
 
@@ -154,22 +152,16 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # [NEW: GATED FUSION] - Learnable gating parameters initialized at 0.0 (sigmoid(0)=0.5)
-        # Intra-GLAli balance (Global image feature vs Local region feature)
-        self.glali_gate = nn.Parameter(torch.tensor(0.0, dtype=self.dtype))
         
         self.tip_adapter = None
         if cache_keys is not None:
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
             
-            # Inter-Method balance (GLAli Text Logic vs Tip-Adapter Visual Cache)
-            # This is a CLASS-SPECIFIC router! (Size: num_classes)
-            # self.fusion_gate = nn.Parameter(torch.zeros(len(classnames), dtype=self.dtype))
             # change to one scaler
             self.fusion_gate = nn.Parameter(torch.tensor(0.0, dtype=self.dtype)) # One scalar for all
-            
-            # Learnable Beta (starting at default 5.5)
-            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
+
+            self.tip_alpha = 1.0  
+            self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
@@ -234,17 +226,14 @@ def forward(self, image, mask=None, labels = None):
         # ---------------- [ROBUST GATED FUSION LOGIC] ----------------
         logit_scale = self.logit_scale.exp()
         
-        # 1. Intra-GLAli Gating (Global vs Local)
-        glali_gate_val = torch.sigmoid(self.glali_gate)
-        
         # Calculate raw similarities (before logit scaling)
         logits_glali_raw = get_dense_logits2(image_features.detach(), local_image_features.detach(), 
                                              updated_proto_norm, updated_proto_mean_norm, 
-                                             topk=self.cfg.topk, glali_gate_val=glali_gate_val)
+                                             topk=self.cfg.topk)
         
         logits_local_glali_raw = get_dense_logits2(image_features, local_image_features, 
                                                    self.all_text_features_tea.detach(), self.text_features_tea.detach(), 
-                                                   topk=self.cfg.topk, glali_gate_val=glali_gate_val)
+                                                   topk=self.cfg.topk)
 
         if self.tip_adapter is not None:
             # 2. Tip-Adapter Logic (Visual Cache)
@@ -340,13 +329,10 @@ class LocProto(TrainerX):
 
         print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys + Gates")
         for name, param in self.model.named_parameters():
-            # [NEW: GATED FUSION] - Added glali_gate and fusion_gate to trainable parameters
+            # [NEW: GATED FUSION] - Added fusion_gate to trainable parameters
             if ('image_encoder.transformer.resblocks.11.attn' in name or 
                 'bonder' in name or 
-                'tip_adapter' in name or 
-                'fusion_gate' in name or 
-                'glali_gate' in name or 
-                'tip_beta' in name):
+                'fusion_gate' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -374,7 +360,6 @@ class LocProto(TrainerX):
                 tip_params =[
                     self.model.tip_adapter.weight,
                     self.model.fusion_gate,
-                    self.model.glali_gate,
                     self.model.tip_beta
                 ]
                 
