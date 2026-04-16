@@ -200,11 +200,17 @@ class CustomCLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
 
+        # Catch the current data type (Float32 or Float16 if using AMP)
+        current_dtype = image_features.dtype
+
         prompts, attention_mask = self.prompt_learner()
         text_stu = self.text_encoder(prompts, attention_mask)
         text_stu = text_stu / text_stu.norm(dim=-1, keepdim=True)
 
-        text_prototypes = self.text_prototypes.detach()
+        # Cast text parameters to the same dtype as image_features to avoid Float/Half mismatch
+        text_prototypes = self.text_prototypes.detach().to(current_dtype)
+        all_text_features_tea = self.all_text_features_tea.to(current_dtype)
+
         n_disc, c, d = text_prototypes.shape
         id_loc_feats = None
         ood_loc_feats = None
@@ -214,7 +220,7 @@ class CustomCLIP(nn.Module):
         if labels is not None and self.cfg.is_bonder:
             bs = labels.shape[0]
             l2p = text_prototypes[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
-            l2p_tea = self.all_text_features_tea[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
+            l2p_tea = all_text_features_tea[torch.arange(n_disc).view(-1, 1).expand(n_disc, bs), labels, :]
             l2p = torch.transpose(l2p, 0, 1)
             l2p_tea = torch.transpose(l2p_tea, 0, 1)
 
@@ -232,36 +238,42 @@ class CustomCLIP(nn.Module):
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
             text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
             alpha = self.cfg.lambda_value
-            updated_proto = self.text_prototypes
+            updated_proto = text_prototypes.clone()
             
             contra_labels = torch.arange(c).view(-1,1).cuda()
-            mask = torch.eq(labels.unsqueeze(1), contra_labels.T).float().cuda()
+            mask = torch.eq(labels.unsqueeze(1), contra_labels.T).to(current_dtype).cuda()
             update_features = torch.matmul(mask.view(bs, c).transpose(0,1).unsqueeze(0).repeat(n_disc-1,1,1), text_bias.transpose(1, 0))
-            proto_mask = torch.zeros(c, dtype=torch.int).cuda()
-            proto_mask[labels] = 1
+            
+            proto_mask = torch.zeros(c, dtype=current_dtype).cuda()
+            proto_mask[labels] = 1.0
             proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
-            update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
+            
+            update_features = torch.cat([text_prototypes[0:1, :, :], update_features], dim=0)
             updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
 
             updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
         else:
-            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
+            updated_proto_norm = text_prototypes / text_prototypes.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
-        logit_scale = self.logit_scale.exp()
+        logit_scale = self.logit_scale.exp().to(current_dtype)
         
         logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        
+        text_features_tea = all_text_features_tea.mean(dim=0)
+        text_features_tea = text_features_tea / text_features_tea.norm(dim=-1, keepdim=True)
+        
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, all_text_features_tea.detach(), text_features_tea.detach(), topk=self.cfg.topk)
 
         if self.tip_adapter is not None:
-            affinity = self.tip_adapter(image_features)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
+            affinity = self.tip_adapter(image_features.to(self.tip_adapter.weight.dtype))
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             scaled_cache_logits = cache_logits * self.tip_alpha
-            logits = logits + scaled_cache_logits
-            logits_local = logits_local + scaled_cache_logits
+            logits = logits + scaled_cache_logits.to(current_dtype)
+            logits_local = logits_local + scaled_cache_logits.to(current_dtype)
 
         return logits, logits_local, image_features_tea, image_features, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -362,11 +374,11 @@ class LocProtoBiomed(TrainerX):
         if prec == "amp":
             with autocast():
                 output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
-                all_text_features_tea = self.model.all_text_features_tea.clone()
+                all_text_features_tea = self.model.all_text_features_tea.clone().to(text_stu.dtype)
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                loss_distil_img = F.l1_loss(img_feat_tea.to(img_feat_stu.dtype), img_feat_stu, reduction='mean') * 10
                 
                 if text_stu.shape == all_text_features_tea.shape:
                     loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
@@ -390,11 +402,11 @@ class LocProtoBiomed(TrainerX):
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
-            all_text_features_tea = self.model.all_text_features_tea.clone()
+            all_text_features_tea = self.model.all_text_features_tea.clone().to(text_stu.dtype)
             
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
-            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+            loss_distil_img = F.l1_loss(img_feat_tea.to(img_feat_stu.dtype), img_feat_stu, reduction='mean') * 10
             
             if text_stu.shape == all_text_features_tea.shape:
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
