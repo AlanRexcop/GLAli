@@ -24,10 +24,13 @@ def load_biomedclip(device="cuda"):
             
         local_feat = features[:, 1:, :]
         
-        # 3. Apply OpenCLIP's projection head (maps 768 -> 512 for BiomedCLIP)
-        if hasattr(self, 'head') and isinstance(self.head, torch.nn.Linear):
+        # 3. Apply OpenCLIP's projection head (MLP for BiomedCLIP)
+        if hasattr(self, 'head') and isinstance(self.head, torch.nn.Module):
             global_feat = self.head(global_feat)
-            local_feat = self.head(local_feat) # nn.Linear broadcasts across the sequence dimension automatically
+            local_feat = self.head(local_feat)
+        elif hasattr(self, 'head') and self.head is not None: # fallback for tensor proj
+            global_feat = global_feat @ self.head
+            local_feat = local_feat @ self.head
             
         return global_feat, local_feat, None
 

@@ -69,7 +69,10 @@ class TextEncoder(nn.Module):
         outputs = self.text_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         pooled_out = outputs.last_hidden_state[:, 0, :]
         if self.proj is not None:
-            pooled_out = pooled_out @ self.proj
+            if isinstance(self.proj, nn.Module):
+                pooled_out = self.proj(pooled_out)
+            else:
+                pooled_out = pooled_out @ self.proj
         return pooled_out
 
 class PromptLearner(nn.Module):
