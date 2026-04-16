@@ -164,7 +164,9 @@ class CustomCLIP(nn.Module):
             
             # Inter-Method balance (GLAli Text Logic vs Tip-Adapter Visual Cache)
             # This is a CLASS-SPECIFIC router! (Size: num_classes)
-            self.fusion_gate = nn.Parameter(torch.zeros(len(classnames), dtype=self.dtype))
+            # self.fusion_gate = nn.Parameter(torch.zeros(len(classnames), dtype=self.dtype))
+            # change to one scaler
+            self.fusion_gate = nn.Parameter(torch.tensor(0.0, dtype=self.dtype)) # One scalar for all
             
             # Learnable Beta (starting at default 5.5)
             self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
@@ -173,7 +175,7 @@ class CustomCLIP(nn.Module):
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
-    def forward(self, image, mask=None, labels = None):
+def forward(self, image, mask=None, labels = None):
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
             image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
@@ -229,32 +231,53 @@ class CustomCLIP(nn.Module):
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
+        # ---------------- [ROBUST GATED FUSION LOGIC] ----------------
         logit_scale = self.logit_scale.exp()
         
-        # [NEW: GATED FUSION] - Evaluate the glali gate (bounded 0 to 1)
+        # 1. Intra-GLAli Gating (Global vs Local)
         glali_gate_val = torch.sigmoid(self.glali_gate)
         
-        logits_glali = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, glali_gate_val=glali_gate_val)
-        logits_local_glali = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, glali_gate_val=glali_gate_val)
+        # Calculate raw similarities (before logit scaling)
+        logits_glali_raw = get_dense_logits2(image_features.detach(), local_image_features.detach(), 
+                                             updated_proto_norm, updated_proto_mean_norm, 
+                                             topk=self.cfg.topk, glali_gate_val=glali_gate_val)
+        
+        logits_local_glali_raw = get_dense_logits2(image_features, local_image_features, 
+                                                   self.all_text_features_tea.detach(), self.text_features_tea.detach(), 
+                                                   topk=self.cfg.topk, glali_gate_val=glali_gate_val)
 
-        # [NEW: GATED FUSION] - Safely blend the two methods without explosion
         if self.tip_adapter is not None:
+            # 2. Tip-Adapter Logic (Visual Cache)
             affinity = self.tip_adapter(image_features)
-            
-            # Ensure Beta stays positive using softplus
             safe_beta = F.softplus(self.tip_beta)
-            logits_cache = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values
+            logits_cache_raw = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values
             
-            # Evaluate the fusion gate (Class-Specific Router)
-            # Shape: [num_classes]. Broadcasts perfectly against logits [bs, num_classes]
-            fusion_gate_val = torch.sigmoid(self.fusion_gate)
+            # 3. [LOGIT STANDARDIZATION]
+            # This is the "Fair Choice" mechanism. It scales both experts to unit variance 
+            # across the class dimension so the gate can blend them effectively.
+            def standardize(x):
+                # We subtract mean and divide by std along the class dimension
+                return (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True) + 1e-8)
+
+            glali_std = standardize(logits_glali_raw)
+            local_std = standardize(logits_local_glali_raw)
+            cache_std = standardize(logits_cache_raw)
+
+            # 4. Gated Fusion (Inter-Method)
+            # fusion_gate is now a scalar nn.Parameter(torch.tensor(0.0))
+            f_gate = torch.sigmoid(self.fusion_gate)
             
-            # Smoothly interpolate: fusion_gate_val limits the ratio between 0 and 1
-            logits = (fusion_gate_val * logits_glali) + ((1.0 - fusion_gate_val) * logits_cache)
-            logits_local = (fusion_gate_val * logits_local_glali) + ((1.0 - fusion_gate_val) * logits_cache)
+            # Weighted average of standardized signals
+            logits = (f_gate * glali_std) + ((1.0 - f_gate) * cache_std)
+            logits_local = (f_gate * local_std) + ((1.0 - f_gate) * cache_std)
+            
+            # 5. Apply Logit Scale
+            # Restore the sharpness of the distribution for CrossEntropy/Softmax
+            logits = logits * logit_scale
+            logits_local = logits_local * logit_scale
         else:
-            logits = logits_glali
-            logits_local = logits_local_glali
+            logits = logits_glali_raw * logit_scale
+            logits_local = logits_local_glali_raw * logit_scale
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
 
@@ -345,7 +368,7 @@ class LocProto(TrainerX):
             # ---------------- [NEW: GATED FUSION] OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.001
+                cfg.OPTIM_TIP.LR = 0.0001
                 
                 # Bundle all the new gating parameters
                 tip_params =[
