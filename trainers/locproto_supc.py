@@ -43,13 +43,13 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50):
-    base_logits = image_features @ mean_text_features.T   
-    image_features = image_features.unsqueeze(1)  
+def get_dense_logits2(image_features, local_image_features, all_text_features, mean_text_features, topk=50, global_weight=1.0):
+    base_logits = image_features @ mean_text_features.T   #[bs, 512] *[N, 512] ->[bs, N]
+    image_features = image_features.unsqueeze(1)  #[bs, 1, 512]
     all_image_features = local_image_features
-    w = torch.einsum('bmd,bnd->bmn', image_features, all_image_features) 
+    w = torch.einsum('bmd,bnd->bmn', image_features, all_image_features) #[bs, 1, 197]
 
-    mean_text_features = mean_text_features.unsqueeze(0) 
+    mean_text_features = mean_text_features.unsqueeze(0) #[n_desc, N, 512]
     _,n_cls,d = mean_text_features.shape
     all_text_features = all_text_features.reshape(-1, n_cls, d)
     v = torch.einsum('mcd,ncd->mnc', mean_text_features, all_text_features)  
@@ -63,9 +63,10 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
     mat = sim * weight
     
     bias_logits = torch.sum(mat, dim=(-2,-1))
-    logits = base_logits + bias_logits
+    
+    # --- TWEAK 3: Apply the learnable global_weight to the global base_logits ---
+    logits = (global_weight * base_logits) + bias_logits
     return logits
-
 
 def get_supc_loss(g_img_feats, id_loc_feats, ood_loc_feats, text_stu, text_tea, label, n_class=99, topk=50):
     bs, k, d = id_loc_feats.shape
@@ -151,19 +152,11 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
+        # Cache will be injected AFTER this class is built (by LocProto.build_model)
         self.tip_adapter = None
-        if cache_keys is not None:
-            print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Reverted to static floats (not nn.Parameter) to prevent explosion
-            self.tip_alpha = 1.0  
-            self.tip_beta = 5.5   
-            
-            self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
-            self.tip_adapter.weight = nn.Parameter(cache_keys) 
-            self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels = None):
+        updated_proto = None
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
             image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
@@ -199,7 +192,7 @@ class CustomCLIP(nn.Module):
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
             text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
-            alpha = self.cfg.lambda_value
+            alpha_b = self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
             contra_labels = torch.arange(c).view(-1,1).cuda()
@@ -209,7 +202,7 @@ class CustomCLIP(nn.Module):
             proto_mask[labels] = 1
             proto_mask = proto_mask.view(1, -1, 1).repeat(n_disc, 1, d)
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
-            updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
+            updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha_b * updated_proto + (1-alpha_b) * update_features)
 
             updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
@@ -219,33 +212,44 @@ class CustomCLIP(nn.Module):
             updated_proto_mean = updated_proto_norm.mean(dim=0)
             updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
 
+        # ---------------- SAFE ADAPTIVE PARAMETERS ----------------
+        if getattr(self, "tip_adapter", None) is not None:
+            # Clamp alpha so the memory doesn't overpower the entire model
+            alpha = torch.clamp(self.tip_alpha_raw, min=0.0, max=5.0)
+            # Softplus ensures beta and global_w are strictly positive
+            beta = F.softplus(self.tip_beta_raw)
+            global_w = F.softplus(self.global_weight_raw)
+        else:
+            global_w = torch.tensor(1.0, device=self.device)
+
         logit_scale = self.logit_scale.exp()
         
-        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk)
-        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk)
+        logits = logit_scale * get_dense_logits2(image_features.detach(), local_image_features.detach(), updated_proto_norm, updated_proto_mean_norm, topk=self.cfg.topk, global_weight=global_w)
+        logits_local = logit_scale * get_dense_logits2(image_features, local_image_features, self.all_text_features_tea.detach(), self.text_features_tea.detach(), topk=self.cfg.topk, global_weight=global_w)
 
-        # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
+        # ---------------- LESION-ONLY ADAPTIVE TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # Inference: We don't know the label, so find the most "pathological" patches overall
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) # [n_cls, d]
+            # 1. We don't know the label, so find the most "pathological" patches overall
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
-            # Sim of all patches to all diseases ->[bs, 196, n_cls]
+            # Sim of all patches to all diseases -> [bs, 196, n_cls]
             sim_to_all = torch.matmul(local_image_features, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) # [bs, 196]
             
-            # Select Top-K most "disease-like" patches
+            # 2. Select Top-K most "disease-like" patches
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            # Extract and average to form the Lesion Query
+            # 3. Extract and average to form the Lesion Query
             lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            # Match lesion query against the Lesion Cache
+            # 4. Match lesion query against the Lesion Cache
             affinity = self.tip_adapter(lesion_query)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
             
-            scaled_cache_logits = cache_logits * self.tip_alpha
+            # 5. Apply Learnable Beta and Alpha
+            cache_logits = torch.exp(-beta * (1.0 - affinity)) @ self.cache_values
+            scaled_cache_logits = cache_logits * alpha
             
             logits = logits + scaled_cache_logits
             logits_local = logits_local + scaled_cache_logits
@@ -271,14 +275,15 @@ class LocProto(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
+        if cfg.TRAINER.LOCOOP.PREC in["fp32", "amp"]:
             clip_model.float()
 
         print("Building custom CLIP")
+        # Build the model FIRST so we can use its Text Prototypes to find the lesions
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=None, cache_values=None)
         self.model.to(self.device)
 
-        # ---------------- CONSTRUCT LESION-ONLY TIP-ADAPTER CACHE ----------------
+        # ---------------- CONSTRUCT LESION-ONLY CACHE ----------------
         print("Extracting Pristine Visual Memory Cache (Lesion-Only) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
@@ -306,8 +311,8 @@ class LocProto(TrainerX):
                 _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
                 local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
-                # Use ground truth label to find EXACT lesion patches
-                gt_text = text_tea[label].unsqueeze(1) # [bs, 1, d]
+                # Use ground truth label to find EXACT lesion patches for the cache!
+                gt_text = text_tea[label].unsqueeze(1) #[bs, 1, d]
                 sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1) #[bs, 196]
                 
                 # Get Top-K lesion patches
@@ -316,7 +321,7 @@ class LocProto(TrainerX):
                 d_dim = local_feat.shape[-1]
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
                 
-                # Average lesion patches for cache representation
+                # Average lesion patches for the cache representation
                 lesion_feat_mean = lesion_feats.mean(dim=1)
                 lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
                 
@@ -327,20 +332,34 @@ class LocProto(TrainerX):
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter...")
-        self.model.tip_alpha = 1.0  
-        self.model.tip_beta = 5.5   
+        print("Injecting Lesion-Only Cache and Adaptive Params into Tip-Adapter...")
+        # Add the Learnable Global Parameters
+        self.model.tip_alpha_raw = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype))
+        self.model.tip_beta_raw = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype))
+        self.model.global_weight_raw = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype))
+        
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
         self.model.register_buffer("cache_values", cache_values)
         # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
+        print("Configuring Gradients: Vision Encoder + Bonder + Adaptive Tip-Adapter")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
+            if ('image_encoder.transformer.resblocks.11.attn' in name or 
+                'bonder' in name or 
+                'tip_adapter' in name or 
+                'tip_alpha_raw' in name or 
+                'tip_beta_raw' in name or 
+                'global_weight_raw' in name):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
+
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
 
         self.model.to(self.device)
         
@@ -356,15 +375,28 @@ class LocProto(TrainerX):
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # ---------------- FIX 3: CORRECT TIP-ADAPTER OPTIMIZER ----------------
+            # ---------------- REGISTER ADAPTIVE TIP-ADAPTER OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
                 cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
                 cfg.OPTIM_TIP.LR = 0.001
-                # ONLY the keys (adapter.weight) are optimized, NOT tip_alpha
-                self.optim_tip = build_optimizer(self.model.tip_adapter, cfg.OPTIM_TIP)
+                
+                # Bundle the adapter keys with the new Tweak parameters!
+                adaptive_params =[
+                    self.model.tip_adapter.weight, 
+                    self.model.tip_alpha_raw, 
+                    self.model.tip_beta_raw, 
+                    self.model.global_weight_raw
+                ]
+                
+                self.optim_tip = build_optimizer(adaptive_params, cfg.OPTIM_TIP)
                 self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ----------------------------------------------------------------------
+            # -------------------------------------------------------------------------
+
+        elif "RN" in cfg.MODEL.BACKBONE.NAME:
+            self.optim = build_optimizer(self.model.image_encoder.attnpool, cfg.OPTIM)
+            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+            self.register_model("attn_learner", self.model.image_encoder.attnpool, self.optim, self.sched)
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
 
