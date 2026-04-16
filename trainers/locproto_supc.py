@@ -359,8 +359,7 @@ class LocProto(TrainerX):
                 # Bundle all the new gating parameters
                 tip_params =[
                     self.model.tip_adapter.weight,
-                    self.model.fusion_gate,
-                    self.model.tip_beta
+                    self.model.fusion_gate
                 ]
                 
                 self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
