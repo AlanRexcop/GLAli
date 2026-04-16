@@ -167,7 +167,7 @@ class CustomCLIP(nn.Module):
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
-def forward(self, image, mask=None, labels = None):
+    def forward(self, image, mask=None, labels = None):
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
             image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
