@@ -163,7 +163,9 @@ class CustomCLIP(nn.Module):
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             
             # Weighted Average Parameter
-            self.tip_adapter.register_parameter("cache_scale", nn.Parameter(torch.tensor(0.0, dtype=self.dtype).cuda()))
+            # CHANGE THIS LINE (Initialize at -2.0 so sigmoid(-2.0) = ~0.12)
+            # Starts by trusting original CLIP, slowly blends in the Cache to prevent shock
+            self.tip_adapter.register_parameter("cache_scale", nn.Parameter(torch.tensor(-2.0, dtype=self.model.dtype).cuda()))
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels = None):
@@ -326,9 +328,9 @@ class LocProto(TrainerX):
 
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
             
-            # PREVENT GRADIENT EXPLOSION: Force max LR to 1e-4 for dense ViT layers
+            # PREVENT JITTER: Force max LR to 1e-5 for dense ViT layers
             cfg_safe_attn = deepcopy(cfg.OPTIM)
-            cfg_safe_attn.LR = min(cfg.OPTIM.LR, 1e-4) 
+            cfg_safe_attn.LR = min(cfg.OPTIM.LR, 1e-5) # Changed from 1e-4 to 1e-5
             
             self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg_safe_attn)
             self.sched = build_lr_scheduler(self.optim, cfg_safe_attn)
@@ -368,8 +370,9 @@ class LocProto(TrainerX):
                 output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
                 all_text_features_tea = self.model.all_text_features_tea.clone()
                 
-                loss_id = F.cross_entropy(output, label)
-                loss_id2 = F.cross_entropy(output_local, label)
+                # Smooth the loss landscape to prevent wild loss spikes
+                loss_id = F.cross_entropy(output, label, label_smoothing=0.1)
+                loss_id2 = F.cross_entropy(output_local, label, label_smoothing=0.1)
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
@@ -392,8 +395,9 @@ class LocProto(TrainerX):
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
             all_text_features_tea = self.model.all_text_features_tea.clone()
             
-            loss_id = F.cross_entropy(output, label)
-            loss_id2 = F.cross_entropy(output_local, label)
+            # Smooth the loss landscape to prevent wild loss spikes
+            loss_id = F.cross_entropy(output, label, label_smoothing=0.1)
+            loss_id2 = F.cross_entropy(output_local, label, label_smoothing=0.1)
             loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
