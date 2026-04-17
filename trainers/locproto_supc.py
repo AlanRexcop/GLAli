@@ -241,7 +241,9 @@ class CustomCLIP(nn.Module):
             lesion_query = F.normalize(lesion_patches.mean(dim=1), p=2, dim=-1)
             
             affinity = self.tip_adapter(lesion_query)
-            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
+            
+            # SAFEGUARD: explicitly cast cache_values to match affinity dtype inside autocast
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.type_as(affinity)
             
             # WEIGHTED AVERAGE FUSION
             # scale is [0, 1]
@@ -302,9 +304,10 @@ class LocProto(TrainerX):
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
-        cache_keys = torch.cat(cache_keys, dim=0).to(self.device) 
+        # FIXED: Cast the keys and values explicitly to the proper dtype to avoid FP16 vs FP32 matrix multiplication errors
+        cache_keys = torch.cat(cache_keys, dim=0).to(dtype=self.model.dtype, device=self.device) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
-        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
+        cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(dtype=self.model.dtype, device=self.device) 
 
         # Inject into model
         self.model.tip_beta = 5.5   
