@@ -142,9 +142,11 @@ class CustomCLIP(nn.Module):
         _, d = text_features.shape
         self.ndisc = 51
         text_features = text_features.view(self.ndisc, -1, d)
-        self.all_text_features_tea = text_features / text_features.norm(dim=-1, keepdim=True)
+        
+        # SAFE NORMALIZATION
+        self.all_text_features_tea = F.normalize(text_features, p=2, dim=-1)
         text_features_mean = text_features.mean(dim=0)
-        self.text_features_tea = text_features_mean / text_features_mean.norm(dim=-1, keepdim=True)
+        self.text_features_tea = F.normalize(text_features_mean, p=2, dim=-1)
         self.text_prototypes = self.all_text_features_tea   
 
         if cfg.is_bonder:
@@ -157,23 +159,24 @@ class CustomCLIP(nn.Module):
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
             
             self.tip_beta = 5.5   
-            
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
             
-            # Weighted Average Parameter: Initializing at 0.0 means scale=0.5 (equal weight)
+            # Weighted Average Parameter
             self.tip_adapter.register_parameter("cache_scale", nn.Parameter(torch.tensor(0.0, dtype=self.dtype).cuda()))
-            
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels = None):
         with torch.no_grad():
             image_features_tea, local_image_features_tea, _ = self.zs_img_encoder(image.to(self.dtype))
-            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
+            # SAFE NORMALIZATION
+            image_features_tea = F.normalize(image_features_tea, p=2, dim=-1)
         
         image_features, local_image_features, _  = self.image_encoder(image.to(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        local_image_features = local_image_features / local_image_features.norm(dim=-1, keepdim=True)
+        
+        # SAFE NORMALIZATION
+        image_features = F.normalize(image_features, p=2, dim=-1)
+        local_image_features = F.normalize(local_image_features, p=2, dim=-1)
 
         text_prototypes = self.text_prototypes.detach()
         n_disc, c, d = text_prototypes.shape
@@ -201,7 +204,8 @@ class CustomCLIP(nn.Module):
             ood_loc_feats = torch.gather(local_image_features, 1, idx_ood.unsqueeze(-1).expand(-1, -1, d))
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
-            text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
+            # SAFE NORMALIZATION
+            text_bias = F.normalize(text_bias, p=2, dim=-1)
             alpha = self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
@@ -214,13 +218,15 @@ class CustomCLIP(nn.Module):
             update_features = torch.cat([self.text_prototypes[0:1, :, :], update_features], dim=0)
             updated_proto = (1-proto_mask) * updated_proto + proto_mask * (alpha * updated_proto + (1-alpha) * update_features)
 
-            updated_proto_norm = updated_proto / updated_proto.norm(dim=-1, keepdim=True)
+            # SAFE NORMALIZATION
+            updated_proto_norm = F.normalize(updated_proto, p=2, dim=-1)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+            updated_proto_mean_norm = F.normalize(updated_proto_mean, p=2, dim=-1)
         else:
-            updated_proto_norm = self.text_prototypes / self.text_prototypes.norm(dim=-1, keepdim=True)
+            # SAFE NORMALIZATION
+            updated_proto_norm = F.normalize(self.text_prototypes, p=2, dim=-1)
             updated_proto_mean = updated_proto_norm.mean(dim=0)
-            updated_proto_mean_norm = updated_proto_mean / updated_proto_mean.norm(dim=-1, keepdim=True)
+            updated_proto_mean_norm = F.normalize(updated_proto_mean, p=2, dim=-1)
 
         logit_scale = self.logit_scale.exp()
         
@@ -231,25 +237,19 @@ class CustomCLIP(nn.Module):
         if getattr(self, "tip_adapter", None) is not None:
             text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
-            # Select pathology patches
             sim_to_all = torch.matmul(local_image_features, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1)
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            # Cache retrieval
             lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = F.normalize(lesion_patches.mean(dim=1), p=2, dim=-1)
             
             affinity = self.tip_adapter(lesion_query)
             
-            # SAFEGUARD: explicitly cast cache_values to match affinity dtype inside autocast
             cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.type_as(affinity)
             
-            # WEIGHTED AVERAGE FUSION
-            # scale is [0, 1]
             scale = torch.sigmoid(self.tip_adapter.cache_scale)
             
-            # We must apply logit_scale to cache_logits to match the magnitude of the main logits
             logits = (logits * (1 - scale)) + (cache_logits * logit_scale * scale)
             logits_local = (logits_local * (1 - scale)) + (cache_logits * logit_scale * scale)
         # -------------------------------------------------------------------
@@ -292,6 +292,7 @@ class LocProto(TrainerX):
             for batch in tqdm(cache_loader, desc="Building Cache"):
                 image, label = batch["img"].to(self.device), batch["label"].to(self.device)
                 _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
+                # SAFE NORMALIZATION
                 local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
                 gt_text = text_tea[label].unsqueeze(1) 
@@ -299,12 +300,12 @@ class LocProto(TrainerX):
                 _, idx_pos = torch.topk(sim_to_gt, k=self.top_k, dim=1)
                 
                 lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, local_feat.shape[-1]))
+                # SAFE NORMALIZATION
                 lesion_feat_mean = F.normalize(lesion_feats.mean(dim=1), p=2, dim=-1)
                 
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
                 
-        # FIXED: Cast the keys and values explicitly to the proper dtype to avoid FP16 vs FP32 matrix multiplication errors
         cache_keys = torch.cat(cache_keys, dim=0).to(dtype=self.model.dtype, device=self.device) 
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).to(dtype=self.model.dtype, device=self.device) 
@@ -324,13 +325,21 @@ class LocProto(TrainerX):
                 param.requires_grad_(False)
 
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
-            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
-            self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+            
+            # PREVENT GRADIENT EXPLOSION: Force max LR to 1e-4 for dense ViT layers
+            cfg_safe_attn = deepcopy(cfg.OPTIM)
+            cfg_safe_attn.LR = min(cfg.OPTIM.LR, 1e-4) 
+            
+            self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg_safe_attn)
+            self.sched = build_lr_scheduler(self.optim, cfg_safe_attn)
             self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
             
             if cfg.is_bonder:
-                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM)
-                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM)
+                cfg_safe_bonder = deepcopy(cfg.OPTIM)
+                cfg_safe_bonder.LR = min(cfg.OPTIM.LR, 1e-4)
+                
+                self.optim2 = build_optimizer(self.model.bonder, cfg_safe_bonder)
+                self.sched2 = build_lr_scheduler(self.optim2, cfg_safe_bonder)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
@@ -338,8 +347,11 @@ class LocProto(TrainerX):
                     {"params": [self.model.tip_adapter.weight], "lr": 0.001},
                     {"params": [self.model.tip_adapter.cache_scale], "lr": 0.001} 
                 ]
-                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM)
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM)
+                # It's fine for the tip adapter adapter keys to have LR 0.001
+                cfg_tip = deepcopy(cfg.OPTIM)
+                cfg_tip.LR = 0.001
+                self.optim_tip = build_optimizer(tip_params, cfg_tip)
+                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg_tip)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
@@ -365,9 +377,16 @@ class LocProto(TrainerX):
 
             for name in self._optims:
                 if self._optims[name] is not None: self._optims[name].zero_grad()
+                
             self.scaler.scale(loss).backward()
+            
+            # SAFEGUARD: Clip gradients before stepping to prevent explosion
             for name in self._optims:
-                if self._optims[name] is not None: self.scaler.step(self._optims[name])
+                if self._optims[name] is not None: 
+                    self.scaler.unscale_(self._optims[name])
+                    torch.nn.utils.clip_grad_norm_(self._models[name].parameters(), max_norm=1.0)
+                    self.scaler.step(self._optims[name])
+                    
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
@@ -382,9 +401,14 @@ class LocProto(TrainerX):
 
             for name in self._optims:
                 if self._optims[name] is not None: self._optims[name].zero_grad()
+                
             loss.backward()
+            
+            # SAFEGUARD: Clip gradients
             for name in self._optims:
-                if self._optims[name] is not None: self._optims[name].step()
+                if self._optims[name] is not None: 
+                    torch.nn.utils.clip_grad_norm_(self._models[name].parameters(), max_norm=1.0)
+                    self._optims[name].step()
 
         loss_summary = {
             "loss": loss.item(), "loss_id": loss_id.item(), "loss_distil_img": loss_distil_img.item(),
@@ -456,7 +480,7 @@ class LocProto(TrainerX):
         image = Image.open(img_path).convert("RGB")
         image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
         _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
-        local_features = local_features / local_features.norm(dim=-1, keepdim=True)
+        local_features = F.normalize(local_features, p=2, dim=-1)
         target_text = self.model.text_features_tea[label_idx] 
         patch_scores = (local_features[0] @ target_text).float()
         patch_scores = (patch_scores - patch_scores.min()) / (patch_scores.max() + 1e-8)
