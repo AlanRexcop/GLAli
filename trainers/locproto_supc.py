@@ -81,22 +81,25 @@ def get_dense_logits2(image_features, local_image_features, all_text_features, m
 
 def get_supc_loss(global_feats, id_loc_feats, ood_loc_feats, label, n_class):
     """
-    GLAli's Local Contrastive Loss constraint modified for standard SupConLoss.
-    Pulls together global and top-k features of the same class, pushes apart other classes,
-    and assigns all bottom-k irrelevant patches to a generic OOD label.
+    GLAli's Local Contrastive Loss.
+    Correctly constructs [2*bs, k+1, d] tensor so SupConLoss treats the patches
+    as augmented views of the parent image, maintaining training stability.
     """
     bs, k, d = id_loc_feats.shape
     
-    # [bs, 1, d] and [bs, k, d] -> [bs, k+1, d]
-    id_feats = torch.cat([global_feats.unsqueeze(1), id_loc_feats], dim=1) 
-    ood_feats = ood_loc_feats 
+    # ID Views: global feature + top_k relevant patches
+    id_feats = torch.cat([global_feats.unsqueeze(1), id_loc_feats], dim=1) # [bs, k+1, d]
     
-    # Flatten everything as independent instance views
-    features = torch.cat([id_feats.reshape(-1, d), ood_feats.reshape(-1, d)], dim=0).unsqueeze(1) # [N, 1, d]
+    # OOD Views: mean irrelevant feature + bottom_k irrelevant patches
+    ood_global = ood_loc_feats.mean(dim=1, keepdim=True)
+    ood_feats = torch.cat([ood_global, ood_loc_feats], dim=1) # [bs, k+1, d]
     
-    l_id = label.unsqueeze(1).repeat(1, k+1).reshape(-1)
-    l_ood = torch.full((bs * k,), n_class, dtype=label.dtype, device=label.device)
-    res_label = torch.cat([l_id, l_ood], dim=0)
+    # Stack along batch dim: [2*bs, k+1, d]
+    features = torch.cat([id_feats, ood_feats], dim=0) 
+    
+    # Create labels: bs ID instances, bs OOD instances
+    ood_label = torch.full((bs,), n_class, dtype=label.dtype, device=label.device)
+    res_label = torch.cat([label, ood_label], dim=0) # [2*bs]
     
     loss = SupConLoss(temperature=0.1)(features=features, labels=res_label)
     return loss
@@ -138,7 +141,7 @@ class GL_DAC_Model(nn.Module):
         # ---------------- GL-DAC ARCHITECTURE MODULES ----------------
         d = self.image_encoder.output_dim
         
-        # DAC Visual Adapter: A single linear layer bridging pre-trained & target domains
+        # DAC Visual Adapter
         self.visual_adapter = nn.Linear(d, d, bias=False).to(self.dtype).to(self.device)
         nn.init.eye_(self.visual_adapter.weight) 
         
@@ -213,20 +216,21 @@ class GL_DAC_Model(nn.Module):
         topk_feats = torch.gather(adapted_local, 1, topk_idx.unsqueeze(-1).expand(-1, -1, d))
         botk_feats = torch.gather(adapted_local, 1, botk_idx.unsqueeze(-1).expand(-1, -1, d))
 
-        # 4. GLAli Visually-Guided Text Refinement
+        # 4. GLAli Visually-Guided Text Refinement (Safe Vectorization)
         if self.training and labels is not None:
-            # Bonder refines the corresponding ground-truth text prototypes using image patches
             l2p = self.text_prototypes[labels] # [bs, n_desc, d]
             text_bias = self.bonder(l2p, topk_feats.detach()) # [bs, n_desc, d]
             
-            # Inject bias for the current forward pass (Gradients flow back to text_prototypes)
-            refined_text = self.text_prototypes.clone()
-            alpha = self.cfg.lambda_value 
+            mask = F.one_hot(labels, num_classes=n_cls).to(self.dtype) # [bs, n_cls]
+            bias_sum = torch.einsum('bc,bnd->cnd', mask, text_bias) # [n_cls, n_desc, d]
+            count = mask.sum(dim=0).unsqueeze(-1).unsqueeze(-1).clamp(min=1)
+            bias_avg = bias_sum / count
             
-            for i in range(bs):
-                refined_text[labels[i]] = (1 - alpha) * refined_text[labels[i]] + alpha * text_bias[i]
+            # Mask so only the classes in the batch get the cross-attention update added
+            mask_cls = (mask.sum(dim=0) > 0).view(n_cls, 1, 1).to(self.dtype)
+            refined_text = self.text_prototypes + self.cfg.lambda_value * bias_avg * mask_cls
         else:
-            # Inference dynamically relies directly on the SGD-optimized text cache natively!
+            # Native DAC fallback: learned cache acts instantly for zero-overhead inference
             refined_text = self.text_prototypes
 
         refined_text_norm = F.normalize(refined_text, p=2, dim=-1)
@@ -244,7 +248,6 @@ class GL_DAC_Model(nn.Module):
         # 6. Intra-Modal Logits (DAC Hierarchical Visual Cache)
         intra_logits = torch.zeros_like(inter_logits)
         if self.raw_cache_local_feats is not None:
-            # Adapt the memory cache dynamically
             cache_adapted = self.visual_adapter(self.raw_cache_local_feats.type_as(adapted_local))
             cache_adapted = F.normalize(cache_adapted, p=2, dim=-1)
             
@@ -307,7 +310,6 @@ class LocProto(TrainerX):
 
         # ---------------- GRADIENT CONFIGURATION ----------------
         for name, param in self.model.named_parameters():
-            # Activate gradients for GL-DAC components
             if any(key in name for key in ['visual_adapter', 'bonder', 'text_prototypes', 'ensemble_scale']):
                 param.requires_grad_(True)
             else:
@@ -333,7 +335,6 @@ class LocProto(TrainerX):
         with autocast(enabled=(prec == "amp")):
             output, _, _, adapted_global, topk_feats, botk_feats, _ = self.model(image, labels=label)
             
-            # Extract Distillation Targets from Teacher CLIP
             with torch.no_grad():
                 _, local_tea, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
                 local_tea = F.normalize(local_tea, p=2, dim=-1)
@@ -341,10 +342,9 @@ class LocProto(TrainerX):
                 
             loss_id = F.cross_entropy(output, label, label_smoothing=0.1)
             
-            # Local Contrastive Loss pushes irrelevant patches to OOD mapping and groups ID features
+            # Now stabilized and mapped correctly
             loss_supc = get_supc_loss(adapted_global, topk_feats, botk_feats, label, n_class=len(self.dm.dataset.classnames))
             
-            # DAC Regularization: maintain core multi-modal alignment
             if isinstance(self.model, nn.DataParallel):
                 loss_distil_text = F.l1_loss(self.model.module.text_prototypes, self.model.module.base_text_features) * 25
             else:
@@ -400,7 +400,7 @@ class LocProto(TrainerX):
         self.set_model_mode("eval")
         self.evaluator.reset()
         
-        # FIX: Ensure split correctly resolves when None (e.g. when called from eval scripts)
+        # Explicitly enforce correct split logic
         if split is None:
             split = self.cfg.TEST.SPLIT
             
@@ -440,7 +440,6 @@ class LocProto(TrainerX):
         mcm_score = []
         
         for batch in tqdm(data_loader):
-            # Gracefully handle dataloaders that yield dicts or lists
             if isinstance(batch, dict):
                 images = batch["img"].cuda()
             else:
@@ -457,10 +456,6 @@ class LocProto(TrainerX):
 
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
-        """
-        Maintains visualization mechanics mapping locally-adapted features onto
-        the fully enriched text representations.
-        """
         self.set_model_mode("eval")
         tfm_test = build_transform(self.cfg, is_train=False)
         image = Image.open(img_path).convert("RGB")
