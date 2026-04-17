@@ -175,7 +175,7 @@ class GL_DAC_Model(nn.Module):
         self.register_buffer("base_text_features", text_features.clone())
         
         # Learnable target text cache (DAC inter-modal fine-tuning)
-        self.text_cache = nn.Parameter(text_features.clone()) 
+        self.text_prototypes = nn.Parameter(text_features.clone()) 
         
         # ---------------- VISUAL CACHE BUFFERS ----------------
         self.register_buffer("raw_cache_local_feats", None)
@@ -184,7 +184,7 @@ class GL_DAC_Model(nn.Module):
 
     def forward(self, image, labels=None):
         bs = image.shape[0]
-        n_cls, n_desc, d = self.text_cache.shape
+        n_cls, n_desc, d = self.text_prototypes.shape
         
         # 1. Feature Extraction
         with torch.no_grad():
@@ -199,7 +199,7 @@ class GL_DAC_Model(nn.Module):
 
         # 3. Top-k and Bottom-k Extraction (GLAli)
         with torch.no_grad():
-            base_text_mean = F.normalize(self.text_cache.mean(dim=1).detach(), p=2, dim=-1)
+            base_text_mean = F.normalize(self.text_prototypes.mean(dim=1).detach(), p=2, dim=-1)
             sim_to_text = adapted_local @ base_text_mean.T # [bs, L, n_cls]
             
         if labels is not None:
@@ -215,23 +215,19 @@ class GL_DAC_Model(nn.Module):
 
         # 4. GLAli Visually-Guided Text Refinement
         if self.training and labels is not None:
-            # Refine corresponding ground-truth text prototypes using image patches
-            l2p = self.text_cache[labels] # [bs, n_desc, d]
+            # Bonder refines the corresponding ground-truth text prototypes using image patches
+            l2p = self.text_prototypes[labels] # [bs, n_desc, d]
             text_bias = self.bonder(l2p, topk_feats.detach()) # [bs, n_desc, d]
             
-            bias_full = torch.zeros_like(self.text_cache).unsqueeze(0).repeat(bs, 1, 1, 1) 
-            for i in range(bs):
-                bias_full[i, labels[i]] = text_bias[i]
-            bias_avg = bias_full.mean(dim=0) # [n_cls, n_desc, d]
-            refined_text = self.text_cache + self.cfg.lambda_value * bias_avg
-        else:
-            # Dynamic cross-attention refinement over all classes during inference
-            tc_expand = self.text_cache.unsqueeze(0).expand(bs, -1, -1, -1).reshape(bs * n_cls, n_desc, d)
-            tk_expand = topk_feats.unsqueeze(1).expand(-1, n_cls, -1, -1).reshape(bs * n_cls, self.cfg.topk, d)
-            bias = self.bonder(tc_expand, tk_expand).reshape(bs, n_cls, n_desc, d)
+            # Inject bias for the current forward pass (Gradients flow back to text_prototypes)
+            refined_text = self.text_prototypes.clone()
+            alpha = self.cfg.lambda_value 
             
-            bias_avg = bias.mean(dim=0)
-            refined_text = self.text_cache + self.cfg.lambda_value * bias_avg
+            for i in range(bs):
+                refined_text[labels[i]] = (1 - alpha) * refined_text[labels[i]] + alpha * text_bias[i]
+        else:
+            # Inference dynamically relies directly on the SGD-optimized text cache natively!
+            refined_text = self.text_prototypes
 
         refined_text_norm = F.normalize(refined_text, p=2, dim=-1)
         refined_text_mean_norm = F.normalize(refined_text_norm.mean(dim=1), p=2, dim=-1)
@@ -312,7 +308,7 @@ class LocProto(TrainerX):
         # ---------------- GRADIENT CONFIGURATION ----------------
         for name, param in self.model.named_parameters():
             # Activate gradients for GL-DAC components
-            if any(key in name for key in ['visual_adapter', 'bonder', 'text_cache', 'ensemble_scale']):
+            if any(key in name for key in ['visual_adapter', 'bonder', 'text_prototypes', 'ensemble_scale']):
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -350,9 +346,9 @@ class LocProto(TrainerX):
             
             # DAC Regularization: maintain core multi-modal alignment
             if isinstance(self.model, nn.DataParallel):
-                loss_distil_text = F.l1_loss(self.model.module.text_cache, self.model.module.base_text_features) * 25
+                loss_distil_text = F.l1_loss(self.model.module.text_prototypes, self.model.module.base_text_features) * 25
             else:
-                loss_distil_text = F.l1_loss(self.model.text_cache, self.model.base_text_features) * 25
+                loss_distil_text = F.l1_loss(self.model.text_prototypes, self.model.base_text_features) * 25
                 
             loss_distil_img = F.l1_loss(adapted_global, global_tea) * 10
             
@@ -403,9 +399,29 @@ class LocProto(TrainerX):
     def test(self, split=None):
         self.set_model_mode("eval")
         self.evaluator.reset()
-        data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
+        
+        # FIX: Ensure split correctly resolves when None (e.g. when called from eval scripts)
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+            
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"
+            data_loader = self.test_loader
+            
         print(f"Evaluate on the *{split}* set")
         
+        if self.cfg.is_bonder:
+            try:
+                proto = torch.load(osp.join(self.output_dir, 'proto.pth'))
+                if isinstance(self.model, nn.DataParallel):
+                    self.model.module.text_prototypes.data = proto.data
+                else:
+                    self.model.text_prototypes.data = proto.data
+            except Exception as e:
+                pass
+                
         for batch in tqdm(data_loader):
             input, label = self.parse_batch_test(batch)
             output, _, _, _, _, _, _ = self.model(input)
@@ -424,7 +440,12 @@ class LocProto(TrainerX):
         mcm_score = []
         
         for batch in tqdm(data_loader):
-            images = batch[0].cuda()
+            # Gracefully handle dataloaders that yield dicts or lists
+            if isinstance(batch, dict):
+                images = batch["img"].cuda()
+            else:
+                images = batch[0].cuda()
+                
             output, _, _, _, _, _, _ = self.model(images)
             
             output /= 100.0
@@ -451,7 +472,7 @@ class LocProto(TrainerX):
         adapted_local = mod.visual_adapter(local_features)
         adapted_local = F.normalize(adapted_local, p=2, dim=-1)
         
-        target_text = mod.text_cache[label_idx].mean(dim=0)
+        target_text = mod.text_prototypes[label_idx].mean(dim=0)
         target_text = F.normalize(target_text, p=2, dim=-1)
         
         patch_scores = (adapted_local[0] @ target_text).float()
