@@ -151,16 +151,19 @@ class CustomCLIP(nn.Module):
             self.bonder = CrossAttnBlock(512)
             self.bonder.to(self.dtype)
 
-        # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
+        # ---------------- TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
             print("Initializing Exact Tip-Adapter-F Cache Parameters...")
-            # Reverted to static floats (not nn.Parameter) to prevent explosion
-            self.tip_alpha = 1.0  
+            
             self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
+            
+            # Weighted Average Parameter: Initializing at 0.0 means scale=0.5 (equal weight)
+            self.tip_adapter.register_parameter("cache_scale", nn.Parameter(torch.tensor(0.0, dtype=self.dtype).cuda()))
+            
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels = None):
@@ -226,29 +229,27 @@ class CustomCLIP(nn.Module):
 
         # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            # Inference: We don't know the label, so find the most "pathological" patches overall
-            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) # [n_cls, d]
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype)
             
-            # Sim of all patches to all diseases ->[bs, 196, n_cls]
+            # Select pathology patches
             sim_to_all = torch.matmul(local_image_features, text_tea.T)
-            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) # [bs, 196]
-            
-            # Select Top-K most "disease-like" patches
+            max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1)
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            # Extract and average to form the Lesion Query
+            # Cache retrieval
             lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
-            lesion_query = lesion_patches.mean(dim=1)
-            lesion_query = F.normalize(lesion_query, p=2, dim=-1)
+            lesion_query = F.normalize(lesion_patches.mean(dim=1), p=2, dim=-1)
             
-            # Match lesion query against the Lesion Cache
             affinity = self.tip_adapter(lesion_query)
             cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values
             
-            scaled_cache_logits = cache_logits * self.tip_alpha
+            # WEIGHTED AVERAGE FUSION
+            # scale is [0, 1]
+            scale = torch.sigmoid(self.tip_adapter.cache_scale)
             
-            logits = logits + scaled_cache_logits
-            logits_local = logits_local + scaled_cache_logits
+            # We must apply logit_scale to cache_logits to match the magnitude of the main logits
+            logits = (logits * (1 - scale)) + (cache_logits * logit_scale * scale)
+            logits_local = (logits_local * (1 - scale)) + (cache_logits * logit_scale * scale)
         # -------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
@@ -263,62 +264,40 @@ class LocProto(TrainerX):
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
-
         self.lambda_value = cfg.lambda_value
         self.top_k = cfg.topk
         self.label =[]
 
-        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
-
         if cfg.TRAINER.LOCOOP.PREC in ["fp32", "amp"]:
             clip_model.float()
 
-        print("Building custom CLIP")
         self.model = CustomCLIP(cfg, classnames, clip_model, cache_keys=None, cache_values=None)
         self.model.to(self.device)
 
         # ---------------- CONSTRUCT LESION-ONLY TIP-ADAPTER CACHE ----------------
-        print("Extracting Pristine Visual Memory Cache (Lesion-Only) from training set...")
         tfm_test = build_transform(cfg, is_train=False)
         cache_loader = build_data_loader(
-            cfg,
-            sampler_type="SequentialSampler",
-            data_source=self.dm.dataset.train_x,
-            batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-            tfm=tfm_test,
-            is_train=False
+            cfg, sampler_type="SequentialSampler", data_source=self.dm.dataset.train_x,
+            batch_size=cfg.DATALOADER.TEST.BATCH_SIZE, tfm=tfm_test, is_train=False
         )
 
         self.model.eval()
-        
-        cache_keys = []
-        cache_labels =[]
+        cache_keys, cache_labels = [], []
         
         with torch.no_grad():
             text_tea = self.model.text_features_tea.to(self.device)
-            
             for batch in tqdm(cache_loader, desc="Building Cache"):
-                image = batch["img"].to(self.device)
-                label = batch["label"].to(self.device)
-                
-                # Extract local features via the frozen visual encoder
+                image, label = batch["img"].to(self.device), batch["label"].to(self.device)
                 _, local_feat, _ = self.model.zs_img_encoder(image.type(self.model.dtype))
                 local_feat = F.normalize(local_feat, p=2, dim=-1)
                 
-                # Use ground truth label to find EXACT lesion patches
-                gt_text = text_tea[label].unsqueeze(1) # [bs, 1, d]
-                sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1) #[bs, 196]
-                
-                # Get Top-K lesion patches
+                gt_text = text_tea[label].unsqueeze(1) 
+                sim_to_gt = torch.bmm(local_feat, gt_text.transpose(1, 2)).squeeze(-1)
                 _, idx_pos = torch.topk(sim_to_gt, k=self.top_k, dim=1)
                 
-                d_dim = local_feat.shape[-1]
-                lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, d_dim))
-                
-                # Average lesion patches for cache representation
-                lesion_feat_mean = lesion_feats.mean(dim=1)
-                lesion_feat_mean = F.normalize(lesion_feat_mean, p=2, dim=-1)
+                lesion_feats = torch.gather(local_feat, 1, idx_pos.unsqueeze(-1).expand(-1, -1, local_feat.shape[-1]))
+                lesion_feat_mean = F.normalize(lesion_feats.mean(dim=1), p=2, dim=-1)
                 
                 cache_keys.append(lesion_feat_mean.cpu())
                 cache_labels.append(label.cpu())
@@ -327,47 +306,40 @@ class LocProto(TrainerX):
         cache_labels = torch.cat(cache_labels, dim=0).to(self.device) 
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
-        print("Injecting Lesion-Only Cache into Tip-Adapter...")
-        self.model.tip_alpha = 1.0  
+        # Inject into model
         self.model.tip_beta = 5.5   
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
         self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
+        self.model.tip_adapter.register_parameter("cache_scale", nn.Parameter(torch.tensor(0.0, dtype=self.model.dtype).cuda()))
         self.model.register_buffer("cache_values", cache_values)
-        # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
+        # ---------------- GRADIENT CONFIGURATION ----------------
         for name, param in self.model.named_parameters():
             if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
 
-        self.model.to(self.device)
-        
         if "ViT" in cfg.MODEL.BACKBONE.NAME:
             self.optim = build_optimizer(self.model.image_encoder.transformer.resblocks[-1].attn, cfg.OPTIM)
             self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
             self.register_model("attn_learner", self.model.image_encoder.transformer.resblocks[-1].attn, self.optim, self.sched)
             
             if cfg.is_bonder:
-                cfg.OPTIM2 = deepcopy(cfg.OPTIM)
-                cfg.OPTIM2.LR = cfg.OPTIM.LR
-                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM2)
-                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
+                self.optim2 = build_optimizer(self.model.bonder, cfg.OPTIM)
+                self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # ---------------- FIX 3: CORRECT TIP-ADAPTER OPTIMIZER ----------------
             if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.001
-                # ONLY the keys (adapter.weight) are optimized, NOT tip_alpha
-                self.optim_tip = build_optimizer(self.model.tip_adapter, cfg.OPTIM_TIP)
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
+                tip_params = [
+                    {"params": [self.model.tip_adapter.weight], "lr": 0.001},
+                    {"params": [self.model.tip_adapter.cache_scale], "lr": 0.001} 
+                ]
+                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM)
+                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM)
                 self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ----------------------------------------------------------------------
 
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
-
         device_count = torch.cuda.device_count()
         if device_count > 1:
             self.model = nn.DataParallel(self.model)
@@ -386,19 +358,13 @@ class LocProto(TrainerX):
                 loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
-                
                 loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
             for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].zero_grad()
-                    
+                if self._optims[name] is not None: self._optims[name].zero_grad()
             self.scaler.scale(loss).backward()
-            
             for name in self._optims:
-                if self._optims[name] is not None:
-                    self.scaler.step(self._optims[name])
-                    
+                if self._optims[name] is not None: self.scaler.step(self._optims[name])
             self.scaler.update()
         else:
             output, output_local, img_feat_tea, img_feat_stu, text_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea = self.model(image, labels=label)
@@ -409,25 +375,17 @@ class LocProto(TrainerX):
             loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
-            
             loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
 
             for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].zero_grad()
-                    
+                if self._optims[name] is not None: self._optims[name].zero_grad()
             loss.backward()
-            
             for name in self._optims:
-                if self._optims[name] is not None:
-                    self._optims[name].step()
+                if self._optims[name] is not None: self._optims[name].step()
 
         loss_summary = {
-            "loss": loss.item(),
-            "loss_id": loss_id.item(),
-            "loss_distil_img": loss_distil_img.item(),
-            "loss_distil_text": loss_distil_text.item(),
-            "acc": compute_accuracy(output_local, label)[0].item(),
+            "loss": loss.item(), "loss_id": loss_id.item(), "loss_distil_img": loss_distil_img.item(),
+            "loss_distil_text": loss_distil_text.item(), "acc": compute_accuracy(output_local, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
@@ -437,128 +395,67 @@ class LocProto(TrainerX):
         return loss_summary
 
     def parse_batch_train(self, batch):
-        input = batch["img"]
-        label = batch["label"]
-        input = input.to(self.device)
-        label = label.to(self.device)
-        return input, label
+        return batch["img"].to(self.device), batch["label"].to(self.device)
 
     def load_model(self, directory, epoch=None):
-        if not directory:
-            return
-
+        if not directory: return
         names = self.get_model_names()
         model_file = "model-best.pth.tar" if epoch is None else f"model.pth.tar-{epoch}"
-
         for name in names:
             model_path = osp.join(directory, name, model_file)
-            if not osp.exists(model_path):
-                raise FileNotFoundError(f'Model not found at "{model_path}"')
-
             checkpoint = load_checkpoint(model_path)
             state_dict = checkpoint["state_dict"]
-
             keys_to_delete =[k for k in state_dict.keys() if "token_prefix" in k or "token_suffix" in k]
-            for k in keys_to_delete:
-                del state_dict[k]
-
-            print(f'Loading weights to {name} from "{model_path}"')
+            for k in keys_to_delete: del state_dict[k]
             self._models[name].load_state_dict(state_dict, strict=False)
 
     @torch.no_grad()
     def test(self, split=None):
-        self.model.image_features_store =[]
         self.set_model_mode("eval")
         self.evaluator.reset()
-
-        if split is None:
-            split = self.cfg.TEST.SPLIT
-
         data_loader = self.val_loader if (split == "val" and self.val_loader is not None) else self.test_loader
-
         print(f"Evaluate on the *{split}* set")
-
         if self.cfg.is_bonder:
             self.model.text_prototypes = torch.load(osp.join(self.output_dir, 'proto.pth'))
-            
-        for batch_idx, batch in enumerate(tqdm(data_loader)):
+        for batch in tqdm(data_loader):
             input, label = self.parse_batch_test(batch)
             output = self.model_inference(input)
             if len(output) >= 2:
-                if self.cfg.is_bonder:
-                    output = output[1] + 0.05 * output[0]
-                else:
-                    output = output[0]
-            self.label.append(label)
+                output = output[1] + 0.05 * output[0] if self.cfg.is_bonder else output[0]
             self.evaluator.process(output, label)
-
         results = self.evaluator.evaluate()
-
         for k, v in results.items():
-            tag = f"{split}/{k}"
-            self.write_scalar(tag, v, self.epoch)
-
+            self.write_scalar(f"{split}/{k}", v, self.epoch)
         return list(results.values())[0]
 
     @torch.no_grad()
     def test_ood(self, data_loader, T):
-        self.model.image_features_store =[]
         to_np = lambda x: x.data.cpu().numpy()
         concat = lambda x: np.concatenate(x, axis=0)
-
         self.set_model_mode("eval")
-        self.evaluator.reset()
-
         mcm_score =[]
-        for batch_idx, batch in enumerate(tqdm(data_loader)):
-            (images, labels, *id_flag) = batch
-            if isinstance(images, str):
-                images, label = self.parse_batch_test(batch)
-            else:
-                images = images.cuda()
+        for batch in tqdm(data_loader):
+            images = batch[0].cuda()
             output, output_local, _, _, _, _, _, _, _ = self.model_inference(images)
-            if self.cfg.is_bonder:
-                output = output_local + 0.05 * output
+            if self.cfg.is_bonder: output = output_local + 0.05 * output
             output /= 100.0
             smax_global = to_np(F.softmax(output/T, dim=-1))  
-            mcm_global_score = -np.max(smax_global, axis=1)
-            mcm_score.append(mcm_global_score)
-
+            mcm_score.append(-np.max(smax_global, axis=1))
         res = concat(mcm_score)[:len(data_loader.dataset)].copy()
         return res, res, res, res
 
     @torch.no_grad()
     def test_visualize(self, img_path, label_idx):
-        """
-        Generates a 14x14 heatmap showing which parts of the image 
-        the model used to predict the given disease label.
-        """
         self.set_model_mode("eval")
-        
-        # 1. Use the proper test transforms
         from dassl.data.transforms import build_transform
         from PIL import Image
-        
         tfm_test = build_transform(self.cfg, is_train=False)
         image = Image.open(img_path).convert("RGB")
         image_tensor = tfm_test(image).unsqueeze(0).to(self.device)
-        
-        # 2. Extract image patches directly from the vision encoder
         _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
-        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape: [1, 196, 512]
-        
-        # 3. Get the text prototype for the requested class
-        # text_features_tea contains the mean text embeddings for all classes [num_classes, 512]
+        local_features = local_features / local_features.norm(dim=-1, keepdim=True)
         target_text = self.model.text_features_tea[label_idx] 
-        
-        # 4. Compute cosine similarity between the 196 patches and the text
-        patch_scores = (local_features[0] @ target_text).float() # Shape: [196]
-        
-        # 5. Min-Max scale the scores so they look good on a heatmap (0 to 1)
-        patch_scores = patch_scores - patch_scores.min()
-        patch_scores = patch_scores / (patch_scores.max() + 1e-8)
-        
-        # 6. Reshape to a 14x14 grid
+        patch_scores = (local_features[0] @ target_text).float()
+        patch_scores = (patch_scores - patch_scores.min()) / (patch_scores.max() + 1e-8)
         heatmap = patch_scores.view(14, 14).cpu().numpy()
-        
         return heatmap, image
