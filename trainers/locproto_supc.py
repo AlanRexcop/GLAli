@@ -242,7 +242,7 @@ class CustomCLIP(nn.Module):
             affinity = self.tip_adapter(lesion_query)
             
             affinity = torch.clamp(affinity, max=1.0)
-            cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
+            cache_logits = torch.exp(-self.tip_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
             scaled_cache_logits = (cache_logits * logit_scale) * gate
