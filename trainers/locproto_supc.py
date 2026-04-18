@@ -154,11 +154,10 @@ class CustomCLIP(nn.Module):
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
-            
-            # SIGMOID GATE: Learnable class-specific valve parameter
-            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
-            self.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.dtype))
+            print("Initializing Exact Tip-Adapter-F Cache Parameters...")
+            # Reverted to static floats (not nn.Parameter) to prevent explosion
+            self.tip_alpha = 1.0  
+            self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
             self.tip_adapter.weight = nn.Parameter(cache_keys) 
@@ -297,7 +296,6 @@ class LocProto(TrainerX):
         cache_labels =[]
         
         with torch.no_grad():
-            # FIX 2: Use the exact same 51-LLM-description pool used in inference!
             text_tea = self.model.text_features_tea.to(self.device)
             
             for batch in tqdm(cache_loader, desc="Building Cache"):
