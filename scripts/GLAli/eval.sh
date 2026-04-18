@@ -8,7 +8,7 @@ CTP=end
 
 DATA=./datasets/
 # DATASET=skin40
-CFG=vit_b16_ep25
+CFG=vit_b16_ep50
 
 NCTX=16
 
