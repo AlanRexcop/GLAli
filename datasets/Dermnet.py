@@ -72,7 +72,7 @@ class Dermnet(DatasetBase):
         items = []
 
         for label, folder in enumerate(folders):
-            imnames = listdir_nohidden(os.path.join(split_dir, folder))
+            imnames = listdir_nohidden(os.path.join(split_dir, folder), sort=True)
             classname = classnames[folder]
             for imname in imnames:
                 impath = os.path.join(split_dir, folder, imname)
