@@ -202,7 +202,7 @@ class CustomCLIP(nn.Module):
             
             text_bias = self.bonder(l2p_loc, selected_loc_img_feats.detach())
             text_bias = text_bias / text_bias.norm(dim=-1, keepdim=True)
-            alpha = self.cfg.lambda_value
+            alpha = 0.99#self.cfg.lambda_value
             updated_proto = self.text_prototypes
             
             contra_labels = torch.arange(c).view(-1,1).cuda()
@@ -234,33 +234,31 @@ class CustomCLIP(nn.Module):
 
         # ---------------- IMPROVED: LESION-ONLY TIP-ADAPTER WITH SIGMOID GATING ----------------
         if getattr(self, "tip_adapter", None) is not None:
-            text_tea = self.text_features_tea.to(local_image_features_tea.device).to(self.dtype) 
+            text_tea = self.text_features_tea.to(local_image_features.device).to(self.dtype) 
             
-            # FIX 1: Use local_image_features_tea (from Frozen Encoder) so it stays in the same space as cache_keys
-            sim_to_all = torch.matmul(local_image_features_tea, text_tea.T)
+            # ---> BUG 3 FIX: USE STUDENT FEATURES TO RESTORE GRADIENTS <---
+            sim_to_all = torch.matmul(local_image_features, text_tea.T)
             max_sim_per_patch, _ = torch.max(sim_to_all, dim=-1) 
             
             _, idx_lesion = torch.topk(max_sim_per_patch, k=self.cfg.topk, dim=1)
             
-            lesion_patches = torch.gather(local_image_features_tea, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
+            lesion_patches = torch.gather(local_image_features, 1, idx_lesion.unsqueeze(-1).expand(-1, -1, d))
             lesion_query = lesion_patches.mean(dim=1)
             lesion_query = F.normalize(lesion_query, p=2, dim=-1)
             
-            affinity = self.tip_adapter(lesion_query)
+            # ---> BUG 1 FIX: NORMALIZE LEARNABLE WEIGHTS BEFORE MATRIX MULTIPLY <---
+            normalized_cache_keys = F.normalize(self.tip_adapter.weight, p=2, dim=1)
+            affinity = F.linear(lesion_query, normalized_cache_keys)
             
-            # Softplus ensures beta stays positive safely during training
             safe_beta = F.softplus(self.tip_beta)
             
-            # AMP safety: Match dtypes
             cache_logits = torch.exp(-safe_beta * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # SIGMOID GATING: Soft gate [1, n_cls] bounded between 0 and 1
             gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            
             scaled_cache_logits = (cache_logits * logit_scale) * gate
             
-            # FIX 3: Add cache ONLY to final logits (Do not pollute logits_local gradient)
             logits = logits + scaled_cache_logits
+            logits_local = logits_local + scaled_cache_logits
         # ---------------------------------------------------------------------------------------
 
         return logits, logits_local, image_features_tea, image_features, updated_proto_norm, id_loc_feats, ood_loc_feats, l2p, l2p_tea
@@ -408,7 +406,7 @@ class LocProto(TrainerX):
                 
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 2.0
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
@@ -431,7 +429,7 @@ class LocProto(TrainerX):
             
             loss_id = F.cross_entropy(output, label)
             loss_id2 = F.cross_entropy(output_local, label)
-            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+            loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 2.0
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
