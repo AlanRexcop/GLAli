@@ -142,7 +142,7 @@ def main(args):
 
     if getattr(args, 'visualize', False):
         from utils.detection_util import generate_heatmaps
-        generate_heatmaps(trainer, args.in_dataset)
+        generate_heatmaps(trainer, args.in_dataset + f"_seed{args.seed}")
 
     if args.in_dataset in ['skin40', 'ISIC', 'Dermnet']:
         out_datasets = [item for item in ['skin40', 'ISIC', 'Dermnet'] if item != args.in_dataset]
