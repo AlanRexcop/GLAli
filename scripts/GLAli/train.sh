@@ -7,7 +7,7 @@ DATA=./datasets/
 # DATASET=$2
 DATASET=skin40
 # CFG=$3  # config file
-CFG=vit_b16_ep50
+CFG=vit_b16_ep25
 # CTP=$4  # class token position (end or middle)
 CTP=end
 # NCTX=$5  # number of context tokens
@@ -18,7 +18,7 @@ CSC=False
 lambda=0.25
 topk=50
 
-for SEED in 1
+for SEED in 2 3 5 7 11 13
 do
     for SHOTS in 16
     do

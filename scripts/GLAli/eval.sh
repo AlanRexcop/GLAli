@@ -8,7 +8,7 @@ CTP=end
 
 DATA=./datasets/
 # DATASET=skin40
-CFG=vit_b16_ep50
+CFG=vit_b16_ep25
 
 NCTX=16
 
@@ -22,7 +22,7 @@ for DATASET in skin40  # eurosat fgvc_aircraft stanford_cars skin40 ISIC
 do
     for SHOTS in 16
     do
-        for SEED in 1
+        for SEED in 2 3 5 7 11 13
         do
             CUDA_VISIBLE_DEVICES=0 python eval_ood_detection.py \
             --root ${DATA} \
