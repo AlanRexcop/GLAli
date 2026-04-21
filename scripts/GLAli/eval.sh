@@ -22,7 +22,7 @@ for DATASET in skin40  # eurosat fgvc_aircraft stanford_cars skin40 ISIC
 do
     for SHOTS in 16
     do
-        for SEED in 6 28 496
+        for SEED in 705 994 747 799 217
         do
             CUDA_VISIBLE_DEVICES=0 python eval_ood_detection.py \
             --root ${DATA} \
