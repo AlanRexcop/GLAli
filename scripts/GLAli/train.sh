@@ -18,7 +18,7 @@ CSC=False
 lambda=0.25
 topk=50
 
-for SEED in 2 3 5 7 11 13
+for SEED in 6 28 496
 do
     for SHOTS in 16
     do
