@@ -246,9 +246,8 @@ class CustomCLIP(nn.Module):
             affinity = torch.clamp(affinity, max=1.0)
             cache_logits = torch.exp(-F.softplus(self.tip_beta) * (1.0 - affinity)) @ self.cache_values.to(affinity.dtype)
             
-            # gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
-            # scaled_cache_logits = (cache_logits * logit_scale) * gate
-            scaled_cache_logits = (cache_logits * logit_scale) * self.tip_alpha.to(affinity.dtype)
+            gate = torch.sigmoid(self.tip_alpha).to(affinity.dtype)
+            scaled_cache_logits = (cache_logits * logit_scale) * gate
             
             # FIX 3: Only add to the final logits. Do not corrupt logits_local.
             logits = logits + scaled_cache_logits
