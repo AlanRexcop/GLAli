@@ -154,15 +154,14 @@ class CustomCLIP(nn.Module):
         # ---------------- FIX 1: TIP-ADAPTER-F MEMORY CACHE ----------------
         self.tip_adapter = None
         if cache_keys is not None:
-            print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
+            print("Initializing Tip-Adapter-F with Constant Sigmoid Gate...")
             
-            # SIGMOID GATE: Learnable class-specific valve parameter
-            # self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
-            self.tip_alpha = torch.tensor(2.0, dtype=self.dtype, device=self.device)    
-            self.tip_beta = 5.5   
+            # SIGMOID GATE: Constant class-specific valve parameter
+            self.register_buffer("tip_alpha", torch.tensor(1.0, dtype=self.dtype, device=self.device))
+            self.register_buffer("tip_beta", torch.tensor(5.5, dtype=self.dtype, device=self.device))
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
-            self.tip_adapter.weight = nn.Parameter(cache_keys) 
+            self.tip_adapter.weight = nn.Parameter(cache_keys, requires_grad=False) 
             self.register_buffer("cache_values", cache_values.to(self.dtype).cuda())
 
     def forward(self, image, mask=None, labels = None):
@@ -331,21 +330,18 @@ class LocProto(TrainerX):
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
         print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
-        # self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
-        self.model.tip_alpha = torch.tensor(2.0, dtype=self.model.dtype, device=self.device)   
-        
-        # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
-        self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
-        self.model.global_weight = nn.Parameter(torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        self.model.register_buffer("tip_alpha", torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
+        self.model.register_buffer("tip_beta", torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
+        self.model.register_buffer("global_weight", torch.tensor(1.0, dtype=self.model.dtype, device=self.device))
         
         self.model.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.model.dtype).cuda()
-        self.model.tip_adapter.weight = nn.Parameter(cache_keys) 
+        self.model.tip_adapter.weight = nn.Parameter(cache_keys, requires_grad=False) 
         self.model.register_buffer("cache_values", cache_values)
         # -------------------------------------------------------------------------
 
-        print("Configuring Gradients: Vision Encoder + Bonder + Tip-Adapter Keys")
+        print("Configuring Gradients: Vision Encoder + Bonder")
         for name, param in self.model.named_parameters():
-            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name or 'tip_adapter' in name:
+            if 'image_encoder.transformer.resblocks.11.attn' in name or 'bonder' in name:
                 param.requires_grad_(True)
             else:
                 param.requires_grad_(False)
@@ -364,29 +360,17 @@ class LocProto(TrainerX):
                 self.sched2 = build_lr_scheduler(self.optim2, cfg.OPTIM2)
                 self.register_model("bonder_learner", self.model.bonder, self.optim2, self.sched2)
 
-            # ---------------- FIX 3: CORRECT TIP-ADAPTER OPTIMIZER ----------------
-            if hasattr(self.model, "tip_adapter") and self.model.tip_adapter is not None:
-                cfg.OPTIM_TIP = deepcopy(cfg.OPTIM)
-                cfg.OPTIM_TIP.LR = 0.001
-                
-                # Pass all 4 learnable Tip-Adapter components to the optimizer
-                tip_params =[
-                    self.model.tip_adapter.weight, 
-                    # self.model.tip_alpha,
-                    self.model.tip_beta,
-                    self.model.global_weight
-                ]
-                self.optim_tip = build_optimizer(tip_params, cfg.OPTIM_TIP)
-                
-                self.sched_tip = build_lr_scheduler(self.optim_tip, cfg.OPTIM_TIP)
-                self.register_model("tip_adapter_learner", self.model.tip_adapter, self.optim_tip, self.sched_tip)
-            # ----------------------------------------------------------------------
-
         self.scaler = GradScaler() if cfg.TRAINER.LOCOOP.PREC == "amp" else None
 
         device_count = torch.cuda.device_count()
         if device_count > 1:
             self.model = nn.DataParallel(self.model)
+
+        # Store initial weights for ProLIP regularizer
+        self.model_0 = {}
+        for name, param in self.model.named_parameters():
+            if 'image_encoder' in name and param.requires_grad:
+                self.model_0[name] = param.clone().detach()
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
@@ -403,7 +387,17 @@ class LocProto(TrainerX):
                 loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
-                loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+                loss_prolip = 0.0
+                for name, param in self.model.named_parameters():
+                    if name in self.model_0:
+                        loss_prolip += F.mse_loss(param, self.model_0[name], reduction='sum')
+                
+                lmda = 1.0
+                if hasattr(self.cfg, 'DATASET') and hasattr(self.cfg.DATASET, 'NUM_SHOTS') and self.cfg.DATASET.NUM_SHOTS > 0:
+                    lmda = 1.0 / self.cfg.DATASET.NUM_SHOTS
+                loss_prolip = loss_prolip * lmda
+                
+                loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc + loss_prolip
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -426,7 +420,17 @@ class LocProto(TrainerX):
             loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
             loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
             
-            loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc
+            loss_prolip = 0.0
+            for name, param in self.model.named_parameters():
+                if name in self.model_0:
+                    loss_prolip += F.mse_loss(param, self.model_0[name], reduction='sum')
+            
+            lmda = 1.0
+            if hasattr(self.cfg, 'DATASET') and hasattr(self.cfg.DATASET, 'NUM_SHOTS') and self.cfg.DATASET.NUM_SHOTS > 0:
+                lmda = 1.0 / self.cfg.DATASET.NUM_SHOTS
+            loss_prolip = loss_prolip * lmda
+            
+            loss = loss_id + loss_id2 + loss_distil_img + loss_distil_text + loss_supc + loss_prolip
 
             for name in self._optims:
                 if self._optims[name] is not None:
@@ -443,6 +447,7 @@ class LocProto(TrainerX):
             "loss_id": loss_id.item(),
             "loss_distil_img": loss_distil_img.item(),
             "loss_distil_text": loss_distil_text.item(),
+            "loss_prolip": loss_prolip.item() if isinstance(loss_prolip, torch.Tensor) else loss_prolip,
             "acc": compute_accuracy(output_local, label)[0].item(),
         }
 
@@ -561,7 +566,7 @@ class LocProto(TrainerX):
         
         # 2. Extract image patches directly from the vision encoder
         _, local_features, _ = self.model.image_encoder(image_tensor.type(self.model.dtype))
-        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape: [1, 196, 512]
+        local_features = local_features / local_features.norm(dim=-1, keepdim=True) # Shape:[1, 196, 512]
         
         # 3. Get the text prototype for the requested class
         # text_features_tea contains the mean text embeddings for all classes [num_classes, 512]
