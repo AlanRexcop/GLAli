@@ -387,15 +387,15 @@ class LocProto(TrainerX):
                 loss_id = F.cross_entropy(output, label)
                 loss_id2 = F.cross_entropy(output_local, label)
                 # TUNED: Distillation weights lowered to allow label learning
-                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 1
-                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 5
+                loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu, reduction='mean') * 10
+                loss_distil_text = F.l1_loss(all_text_features_tea, text_stu, reduction='mean') * 25
                 loss_supc = get_supc_loss(img_feat_stu, id_loc_feats, ood_loc_feats, l2p, l2p_tea, label, topk=self.top_k) * 0.5
                 
                 # TUNED: ProLIP Frobenius Regularization
                 loss_prolip = 0.0
                 for name, param in self.model.named_parameters():
                     if name in self.model_0:
-                        loss_prolip += F.mse_loss(param, self.model_0[name], reduction='sum')
+                        loss_prolip += F.mse_loss(param, self.model_0[name], reduction='mean')
                 
                 lmda = 1.0
                 if hasattr(self.cfg, 'DATASET') and hasattr(self.cfg.DATASET, 'NUM_SHOTS') and self.cfg.DATASET.NUM_SHOTS > 0:
