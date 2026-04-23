@@ -157,7 +157,8 @@ class CustomCLIP(nn.Module):
             print("Initializing Tip-Adapter-F with Learnable Sigmoid Gate...")
             
             # SIGMOID GATE: Learnable class-specific valve parameter
-            self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
+            # self.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.dtype))  
+            self.tip_alpha = torch.tensor(2.0, dtype=self.dtype, device=self.device)    
             self.tip_beta = 5.5   
             
             self.tip_adapter = nn.Linear(cache_keys.shape[1], cache_keys.shape[0], bias=False).to(self.dtype).cuda()
@@ -330,7 +331,8 @@ class LocProto(TrainerX):
         cache_values = F.one_hot(cache_labels, num_classes=len(classnames)).float().to(self.device) 
 
         print("Injecting Lesion-Only Cache into Tip-Adapter with Sigmoid Gate...")
-        self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+        # self.model.tip_alpha = nn.Parameter(torch.zeros(1, len(classnames), dtype=self.model.dtype, device=self.device))  
+        self.model.tip_alpha = torch.tensor(2.0, dtype=self.model.dtype, device=self.device)   
         
         # TWEAK 3 FIX: Must be nn.Parameter Tensors, not plain floats!
         self.model.tip_beta = nn.Parameter(torch.tensor(5.5, dtype=self.model.dtype, device=self.device))
@@ -370,7 +372,7 @@ class LocProto(TrainerX):
                 # Pass all 4 learnable Tip-Adapter components to the optimizer
                 tip_params =[
                     self.model.tip_adapter.weight, 
-                    self.model.tip_alpha,
+                    # self.model.tip_alpha,
                     self.model.tip_beta,
                     self.model.global_weight
                 ]
